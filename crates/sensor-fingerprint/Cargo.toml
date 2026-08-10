@@ -1,0 +1,16 @@
+[package]
+name = "trapd-sensor-fingerprint"
+description = "Multi-stage, confidence-weighted device fingerprinting for the TRAPD network sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+trapd-sensor-core = { path = "../sensor-core" }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

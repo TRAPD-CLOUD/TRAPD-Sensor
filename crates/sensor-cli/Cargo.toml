@@ -1,0 +1,26 @@
+[package]
+name = "trapd-sensor-cli"
+description = "Command line tool to enroll and inspect a TRAPD network sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "trapd-sensorctl"
+path = "src/main.rs"
+
+[dependencies]
+trapd-sensor-core = { path = "../sensor-core" }
+trapd-sensor-capture = { path = "../sensor-capture" }
+trapd-sensor-transport = { path = "../sensor-transport" }
+
+tokio = { workspace = true }
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

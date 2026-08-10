@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sensor-core",
+    "crates/sensor-buffer",
+    "crates/sensor-transport",
+    "crates/sensor-capture",
+    "crates/sensor-passive",
+    "crates/sensor-fingerprint",
+    "crates/sensor-active",
+    "crates/sensor-daemon",
+    "crates/sensor-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/TRAPD-CLOUD/TRAPD-Sensor"
+authors = ["TRAPD"]
+
+# Gemeinsame Versionen für alle Crates — verhindert Versions-Drift innerhalb des
+# Workspace und hält die Supply-Chain-Fläche klein (jede Direktabhängigkeit ist
+# unten begründet).
+[workspace.dependencies]
+# Async-Runtime. `rt-multi-thread` für die parallelen Modul-Tasks, `signal` für
+# den graceful Shutdown, `fs`/`io-util` für die WAL-Queue.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "fs",
+    "io-util",
+    "process",
+] }
+# Serialisierung: Config (TOML), Envelope/Events (JSON), WAL-Records.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Fehlerbehandlung: anyhow an den Applikationsrändern, thiserror in den Libs.
+anyhow = "1"
+thiserror = "2"
+# Strukturiertes Logging (JSON in Prod), konsistent mit dem TRAPD-Backend.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Event-IDs: UUIDv7 ist zeitsortiert → Backend-Dedup und WAL-Ordering profitieren.
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# Zeitstempel in RFC3339, wie vom Ingest-Gateway erwartet.
+chrono = { version = "0.4", features = ["serde"] }
+# HTTP-Client zum Backend (rustls statt OpenSSL → statische Builds/musl).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+] }
+# CRC für WAL-Record-Integrität.
+crc32fast = "1"
+# CLI-Parsing.
+clap = { version = "4", features = ["derive", "env"] }
+# Rohe Socket-/Interface-Operationen (AF_PACKET, Capabilities, chmod).
+libc = "0.2"
+# Deterministisches Jitter/Backoff und Probe-Reihenfolge ohne Krypto-Anspruch.
+rand = "0.8"
+# Testing
+tempfile = "3"

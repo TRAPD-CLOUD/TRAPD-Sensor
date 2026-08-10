@@ -1,0 +1,79 @@
+[Unit]
+Description=TRAPD Network Sensor
+Documentation=https://github.com/TRAPD-CLOUD/TRAPD-Sensor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/trapd-sensord --config /etc/trapd-sensor/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# --- Identity -------------------------------------------------------------
+# Der Sensor laeuft nicht als root. Der Dienstnutzer wird ueber sysusers.d
+# angelegt (siehe packaging/systemd/trapd-sensor.sysusers).
+User=trapd-sensor
+Group=trapd-sensor
+
+# --- Capabilities ---------------------------------------------------------
+# CAP_NET_RAW:   AF_PACKET-Socket fuer die Paketaufnahme und ICMP-Proben.
+# CAP_NET_ADMIN: Promiscuous Mode auf dem Interface (SPAN-/Mirror-Port).
+#
+# AmbientCapabilities vergibt sie an den unprivilegierten Prozess;
+# CapabilityBoundingSet deckelt, was er ueberhaupt erlangen koennte. Beide
+# Zeilen gehoeren zusammen — ohne die zweite bliebe das volle Set erreichbar.
+#
+# Wer ohne Promiscuous Mode auskommt (Sensor sieht nur den eigenen Verkehr),
+# kann CAP_NET_ADMIN streichen und promiscuous = false setzen.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# --- Filesystem -----------------------------------------------------------
+# Alles ausser dem State- und Log-Verzeichnis ist schreibgeschuetzt.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=trapd-sensor
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/trapd-sensor
+ConfigurationDirectory=trapd-sensor
+
+# --- Kernel & Devices -----------------------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# AF_PACKET wird fuer die Aufnahme gebraucht, AF_UNIX fuer das Logging,
+# AF_INET/AF_INET6 fuer den Upload. Mehr nicht.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallArchitectures=native
+
+# --- Resources ------------------------------------------------------------
+# Deckel gegen Ausreisser. Die Werte passen zu einem mittleren Homelab
+# (30-100 Geraete); fuer groessere Netze siehe docs/performance.md.
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=64
+
+# --- Logging --------------------------------------------------------------
+Environment=TRAPD_LOG_FORMAT=json
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
