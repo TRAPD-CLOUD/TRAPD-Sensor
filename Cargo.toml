@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/sensor-core", "crates/sensor-buffer"]
+members = [
+    "crates/sensor-core",
+    "crates/sensor-buffer",
+    "crates/sensor-transport",
+]
 
 [workspace.package]
 version = "0.1.0"

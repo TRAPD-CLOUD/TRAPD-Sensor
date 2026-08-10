@@ -1,0 +1,25 @@
+[package]
+name = "trapd-sensor-transport"
+description = "Enrollment, authenticated batch upload and remote configuration for the TRAPD network sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+trapd-sensor-core = { path = "../sensor-core" }
+trapd-sensor-buffer = { path = "../sensor-buffer" }
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
