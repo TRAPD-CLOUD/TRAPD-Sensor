@@ -6,6 +6,8 @@ members = [
     "crates/sensor-transport",
     "crates/sensor-capture",
     "crates/sensor-passive",
+    "crates/sensor-fingerprint",
+    "crates/sensor-active",
 ]
 
 [workspace.package]

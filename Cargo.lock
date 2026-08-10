@@ -1290,6 +1290,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trapd-sensor-active"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rand 0.8.7",
+ "tokio",
+ "tracing",
+ "trapd-sensor-core",
+]
+
+[[package]]
 name = "trapd-sensor-buffer"
 version = "0.1.0"
 dependencies = [
@@ -1325,6 +1336,15 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "trapd-sensor-fingerprint"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "trapd-sensor-core",
 ]
 
 [[package]]

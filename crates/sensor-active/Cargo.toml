@@ -1,0 +1,19 @@
+[package]
+name = "trapd-sensor-active"
+description = "Rate-limited, scope-bounded active discovery for the TRAPD network sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+trapd-sensor-core = { path = "../sensor-core" }
+tokio = { workspace = true }
+tracing.workspace = true
+libc.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
