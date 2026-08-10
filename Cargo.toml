@@ -11,11 +11,16 @@ members = [
     "crates/sensor-daemon",
     "crates/sensor-cli",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# Several locked transitive dependencies use the stabilized Rust 2024 manifest
+# format, and the locked ICU crates require Rust 1.86. Cargo/Rust 1.86 is
+# therefore the real minimum even though this workspace's
+# own crates intentionally remain on edition 2021.
+rust-version = "1.86"
 license = "Apache-2.0"
 repository = "https://github.com/TRAPD-CLOUD/TRAPD-Sensor"
 authors = ["TRAPD"]

@@ -22,6 +22,7 @@
 pub mod probe;
 pub mod rate_limit;
 pub mod scanner;
+pub mod snmp;
 
 pub use probe::{PortProbeResult, PortState};
 pub use rate_limit::RateLimiter;

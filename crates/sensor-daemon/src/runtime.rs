@@ -41,6 +41,7 @@ use crate::state::SensorState;
 /// Wie lange ein `recv()` auf einem stillen Interface wartet, bevor die Schleife
 /// wieder nach Shutdown und abgelaufenen Flow-Fenstern schaut.
 const CAPTURE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Obergrenze der Fingerprint-Registry.
 const MAX_TRACKED_DEVICES: usize = 5_000;
@@ -113,10 +114,12 @@ impl Daemon {
             mpsc::channel::<SensorEvent>(self.config.buffer.channel_capacity);
         let (obs_tx, obs_rx) = mpsc::channel::<Observation>(self.config.buffer.channel_capacity);
 
-        let uploader_handle = tokio::spawn(uploader.run(event_rx, shutdown.clone()));
+        let (producer_shutdown_tx, producer_shutdown) = watch::channel(false);
+        let (uploader_shutdown_tx, uploader_shutdown) = watch::channel(false);
+        let mut uploader_handle = tokio::spawn(uploader.run(event_rx, uploader_shutdown));
 
         // --- Processor ---
-        let processor = tokio::spawn(run_processor(
+        let mut processor = tokio::spawn(run_processor(
             obs_rx,
             event_tx.clone(),
             self.state.clone(),
@@ -133,7 +136,7 @@ impl Daemon {
             );
         }
 
-        let mut capture_handles = Vec::new();
+        let mut capture_handles = tokio::task::JoinSet::new();
         let mut opened = 0u64;
         for interface in interfaces {
             let observer = PassiveObserver::new(
@@ -149,7 +152,7 @@ impl Daemon {
             ) {
                 Ok(source) => {
                     opened += 1;
-                    capture_handles.push(spawn_capture(
+                    capture_handles.spawn(run_capture(
                         source,
                         observer,
                         self.config
@@ -158,7 +161,7 @@ impl Daemon {
                             .max(trapd_sensor_capture::RECOMMENDED_SNAPLEN),
                         obs_tx.clone(),
                         self.state.clone(),
-                        shutdown.clone(),
+                        producer_shutdown.clone(),
                     ));
                 }
                 Err(e) => {
@@ -181,13 +184,18 @@ impl Daemon {
             }
         }
         self.state.set_interfaces_up(opened);
+        if opened == 0 {
+            self.state
+                .mark_unhealthy("no capture interface could be opened");
+            return Err(anyhow::anyhow!("no capture interface could be opened"));
+        }
 
         // --- Heartbeat ---
         let heartbeat = tokio::spawn(run_heartbeat(
             obs_tx.clone(),
             self.state.clone(),
             Duration::from_secs(self.config.backend.heartbeat_interval_secs),
-            shutdown.clone(),
+            producer_shutdown.clone(),
         ));
 
         // --- Remote-Config ---
@@ -197,7 +205,7 @@ impl Daemon {
             self.config.clone(),
             self.state.clone(),
             Duration::from_secs(self.config.backend.config_poll_interval_secs),
-            shutdown.clone(),
+            producer_shutdown.clone(),
         ));
 
         // --- Aktive Erkennung ---
@@ -213,45 +221,113 @@ impl Daemon {
                         .map(|a| a.sweep_interval_secs)
                         .unwrap_or(3600),
                 ),
-                shutdown.clone(),
+                producer_shutdown.clone(),
             ))
         });
 
-        // Der Processor endet, wenn der letzte Sender fällt.
-        drop(obs_tx);
-
-        // --- Auf den Shutdown warten ---
-        let outcome = uploader_handle.await?;
-        if let UploaderOutcome::Revoked(reason) = &outcome {
-            tracing::error!(reason, "sensor was revoked by the backend — stopping");
-            self.state.set_enabled(false);
-            self.state.set_last_error(Some(reason.clone()));
+        // --- Supervisor: critical tasks may never disappear silently. ---
+        let mut external_shutdown = shutdown;
+        let failure = tokio::select! {
+            _ = external_shutdown.changed() => None,
+            result = &mut processor => Some(format!("event processor stopped unexpectedly: {}", join_description(result))),
+            result = capture_handles.join_next() => Some(format!("capture task stopped unexpectedly: {}", join_option_description(result))),
+            result = &mut uploader_handle => {
+                match result {
+                    Ok(UploaderOutcome::Revoked(reason)) => {
+                        self.state.set_enabled(false);
+                        Some(format!("sensor revoked: {reason}"))
+                    }
+                    Ok(UploaderOutcome::Shutdown) => Some("uploader stopped unexpectedly".into()),
+                    Err(error) => Some(format!("uploader task failed: {error}")),
+                }
+            }
+        };
+        if let Some(error) = &failure {
+            self.state.mark_unhealthy(error.clone());
+            tracing::error!(
+                event = "task_failed",
+                subsystem = "supervisor",
+                error,
+                "critical runtime task failed"
+            );
+        } else {
+            tracing::info!(
+                event = "shutdown_started",
+                subsystem = "supervisor",
+                "graceful shutdown requested"
+            );
         }
 
-        for handle in capture_handles {
-            let _ = handle.await;
+        let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            // Stop all producers first, so their bounded channels can drain.
+            let _ = producer_shutdown_tx.send(true);
+            while let Some(result) = capture_handles.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "capture task join failed during shutdown");
+                }
+            }
+            let _ = heartbeat.await;
+            let _ = config_poll.await;
+            if let Some(sweep) = sweep {
+                let _ = sweep.await;
+            }
+            drop(obs_tx);
+            if !processor.is_finished() {
+                let _ = (&mut processor).await;
+            }
+            drop(event_tx);
+            // Channel closure lets the uploader persist every remaining event.
+            if !uploader_handle.is_finished() {
+                let _ = (&mut uploader_handle).await;
+            }
+            let _ = uploader_shutdown_tx.send(true);
+        })
+        .await;
+        if shutdown_result.is_err() {
+            self.state
+                .mark_unhealthy("global shutdown timeout exceeded");
+            return Err(anyhow::anyhow!(
+                "shutdown exceeded {} seconds",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ));
         }
-        heartbeat.abort();
-        config_poll.abort();
-        if let Some(sweep) = sweep {
-            sweep.abort();
-        }
-        let _ = processor.await;
+        tracing::info!(
+            event = "shutdown_complete",
+            subsystem = "supervisor",
+            "graceful shutdown complete"
+        );
+        failure.map_or(Ok(()), |error| Err(anyhow::anyhow!(error)))
+    }
+}
 
-        Ok(())
+fn join_description(result: Result<(), tokio::task::JoinError>) -> String {
+    match result {
+        Ok(()) => "returned normally".into(),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn join_option_description(
+    result: Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
+) -> String {
+    match result {
+        Some(Ok(Ok(()))) => "returned normally".into(),
+        Some(Ok(Err(error))) => error.to_string(),
+        Some(Err(error)) => error.to_string(),
+        None => "all capture tasks disappeared".into(),
     }
 }
 
 /// Eine Capture-Schleife je Interface.
-fn spawn_capture(
+async fn run_capture(
     mut source: AfPacketSource,
     mut observer: PassiveObserver,
     snaplen: usize,
     obs_tx: mpsc::Sender<Observation>,
     state: Arc<SensorState>,
     shutdown: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let mut buf = vec![0u8; snaplen];
         let interface = source.interface().to_string();
         tracing::info!(interface, snaplen, "capture loop started");
@@ -264,6 +340,7 @@ fn spawn_capture(
             match source.recv(&mut buf) {
                 Ok(0) => {}
                 Ok(n) => {
+                    state.add_capture_bytes(n as u64);
                     let now = chrono::Utc::now();
                     for observation in observer.handle_frame(&buf[..n], now) {
                         // `blocking_send` bremst die Capture-Schleife, wenn der
@@ -272,26 +349,27 @@ fn spawn_capture(
                         // verworfen (und im Zähler sichtbar) als unbegrenzt
                         // wachsender Speicher.
                         if obs_tx.blocking_send(observation).is_err() {
-                            return;
+                            return Ok(());
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!(interface, error = %e, "capture read failed");
                     state.set_last_error(Some(e.to_string()));
-                    break;
+                    return Err(e.into());
                 }
             }
 
             // Abgelaufene Flow-Fenster abgeben.
             for observation in observer.expire(chrono::Utc::now()) {
                 if obs_tx.blocking_send(observation).is_err() {
-                    return;
+                    return Ok(());
                 }
             }
 
             let stats = source.stats();
             state.add_packets(stats.packets_captured, stats.packets_dropped);
+            state.set_parser_errors(observer.parser_errors());
         }
 
         // Beim Herunterfahren das offene Fenster noch abgeben.
@@ -301,7 +379,10 @@ fn spawn_capture(
             }
         }
         tracing::info!(interface, "capture loop stopped");
+        Ok(())
     })
+    .await??;
+    Ok(())
 }
 
 /// Der einzige Ort, an dem aus einer Beobachtung ein Event wird.
@@ -428,6 +509,7 @@ async fn run_config_poll(
             _ = ticker.tick() => {
                 match client.fetch_config(&identity).await {
                     Ok(remote) => {
+                        state.record_remote_config_success();
                         let outcome = remote.apply(&mut config, state.config_version());
                         if outcome.applied {
                             state.set_config_version(remote.config_version);
@@ -449,6 +531,7 @@ async fn run_config_poll(
                         // die Erfassung einzustellen — der Sensor arbeitet mit
                         // der zuletzt gültigen Konfiguration weiter.
                         tracing::warn!(error = %e, "could not fetch remote configuration");
+                        state.record_remote_config_error();
                     }
                 }
             }
@@ -482,8 +565,8 @@ async fn run_sweeps(
                 if !state.is_enabled() {
                     continue;
                 }
-                scanner.sweep(&obs_tx, &mut shutdown).await;
-                state.record_sweep();
+                let stats = scanner.sweep(&obs_tx, &mut shutdown).await;
+                state.record_sweep(stats);
             }
         }
     }

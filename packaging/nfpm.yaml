@@ -1,0 +1,36 @@
+name: trapd-sensor
+arch: ${PACKAGE_ARCH}
+platform: linux
+version: ${PACKAGE_VERSION}
+section: net
+priority: optional
+maintainer: TRAPD <support@trapd.cloud>
+description: |-
+  Least-privilege network discovery sensor for TRAPD.
+vendor: TRAPD
+homepage: https://github.com/TRAPD-CLOUD/TRAPD-Sensor
+license: Apache-2.0
+contents:
+  - src: ${BINARY_DIR}/trapd-sensord
+    dst: /usr/bin/trapd-sensord
+    file_info:
+      mode: 0755
+  - src: ${BINARY_DIR}/trapd-sensorctl
+    dst: /usr/bin/trapd-sensorctl
+    file_info:
+      mode: 0755
+  - src: packaging/config.example.toml
+    dst: /etc/trapd-sensor/config.toml.example
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: packaging/systemd/trapd-sensor.service
+    dst: /usr/lib/systemd/system/trapd-sensor.service
+  - src: packaging/systemd/trapd-sensor.sysusers
+    dst: /usr/lib/sysusers.d/trapd-sensor.conf
+  - src: packaging/systemd/trapd-sensor.tmpfiles
+    dst: /usr/lib/tmpfiles.d/trapd-sensor.conf
+scripts:
+  postinstall: packaging/scripts/postinstall.sh

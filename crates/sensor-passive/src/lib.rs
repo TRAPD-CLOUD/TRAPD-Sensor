@@ -21,6 +21,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod flow;
 pub mod frame;
+pub mod icmpv6;
 pub mod observer;
 pub mod ssdp;
 

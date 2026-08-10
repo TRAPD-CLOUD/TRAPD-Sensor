@@ -21,6 +21,7 @@ use trapd_sensor_core::model::{
 
 use crate::probe::{icmp_echo, tcp_banner, tcp_connect, PortState};
 use crate::rate_limit::RateLimiter;
+use crate::snmp::get_system;
 
 /// Zeitlimit je einzelner Probe.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,6 +33,11 @@ pub struct SweepStats {
     pub hosts_responding: usize,
     pub ports_probed: usize,
     pub ports_open: usize,
+    pub snmp_responding: usize,
+    pub probes_total: usize,
+    pub probe_errors: usize,
+    pub snmp_queries: usize,
+    pub snmp_errors: usize,
     /// Ziele, die die Policy abgelehnt hat.
     pub hosts_skipped: usize,
 }
@@ -126,6 +132,7 @@ impl Scanner {
 
             if active.icmp {
                 self.limiter.acquire().await;
+                stats.probes_total += 1;
                 stats.hosts_probed += 1;
                 match icmp_echo(ip, self.probe_timeout).await {
                     Ok(true) => {
@@ -145,7 +152,63 @@ impl Scanner {
                     }
                     Ok(false) => {}
                     Err(e) => {
+                        stats.probe_errors += 1;
                         tracing::debug!(%ip, error = %e, "icmp probe failed");
+                    }
+                }
+            }
+
+            if !active.tcp_connect {
+                // SNMP is independent from TCP probing.
+            }
+
+            for community in &active.snmp_communities {
+                if *shutdown.borrow() {
+                    break;
+                }
+                self.limiter.acquire().await;
+                stats.probes_total += 1;
+                stats.snmp_queries += 1;
+                let request_id = rand::random::<i32>() & i32::MAX;
+                match get_system(ip, community, request_id, self.probe_timeout).await {
+                    Ok(Some(system)) => {
+                        stats.snmp_responding += 1;
+                        if !host_responded {
+                            host_responded = true;
+                            stats.hosts_responding += 1;
+                        }
+                        let _ = events
+                            .send(Observation::Asset(AssetObservation {
+                                ip: Some(ip),
+                                mac: None,
+                                hostname: system.sys_name.clone(),
+                                vlan_id: None,
+                                subnet: None,
+                                method: DiscoveryMethod::Snmp,
+                                interface: None,
+                            }))
+                            .await;
+                        let banner = system
+                            .sys_descr
+                            .as_deref()
+                            .and_then(|s| trapd_sensor_core::model::sanitize_banner(s.as_bytes()));
+                        let _ = events
+                            .send(Observation::Service(ServiceObservation {
+                                ip,
+                                port: 161,
+                                protocol: TransportProtocol::Udp,
+                                service: Some("snmp".into()),
+                                banner,
+                                method: DiscoveryMethod::Snmp,
+                            }))
+                            .await;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        stats.probe_errors += 1;
+                        stats.snmp_errors += 1;
+                        tracing::debug!(%ip, %error, "SNMP query failed");
                     }
                 }
             }
@@ -159,6 +222,7 @@ impl Scanner {
                     break;
                 }
                 self.limiter.acquire().await;
+                stats.probes_total += 1;
                 stats.ports_probed += 1;
 
                 let result = if active.banner_grab {
