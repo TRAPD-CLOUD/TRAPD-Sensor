@@ -1303,6 +1303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trapd-sensor-capture"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "trapd-sensor-core"
 version = "0.1.0"
 dependencies = [
@@ -1315,6 +1325,16 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "trapd-sensor-passive"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "tracing",
+ "trapd-sensor-core",
 ]
 
 [[package]]

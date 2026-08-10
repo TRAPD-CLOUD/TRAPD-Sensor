@@ -208,7 +208,7 @@ pub struct ServiceObservation {
 /// Datenkanal. Alles darüber wäre faktisch Payload-Mitschnitt.
 pub const MAX_BANNER_LEN: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportProtocol {
     Tcp,

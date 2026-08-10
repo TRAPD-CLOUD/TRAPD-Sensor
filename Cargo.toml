@@ -4,6 +4,8 @@ members = [
     "crates/sensor-core",
     "crates/sensor-buffer",
     "crates/sensor-transport",
+    "crates/sensor-capture",
+    "crates/sensor-passive",
 ]
 
 [workspace.package]
