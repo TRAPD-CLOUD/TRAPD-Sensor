@@ -1,0 +1,5 @@
+# State-Verzeichnis: enthaelt Identity (Bearer-Secret) und die Ereignis-Queue.
+# 0700, weil dort ein Geheimnis liegt.
+d /var/lib/trapd-sensor       0700 trapd-sensor trapd-sensor -
+d /var/lib/trapd-sensor/queue 0700 trapd-sensor trapd-sensor -
+d /etc/trapd-sensor           0750 root         trapd-sensor -

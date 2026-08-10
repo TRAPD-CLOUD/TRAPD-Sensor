@@ -1,0 +1,3 @@
+# Dienstnutzer des Sensors. Systemkonto ohne Login-Shell und ohne Home —
+# der Sensor braucht weder das eine noch das andere.
+u trapd-sensor - "TRAPD Network Sensor" /var/lib/trapd-sensor /usr/sbin/nologin

@@ -8,6 +8,8 @@ members = [
     "crates/sensor-passive",
     "crates/sensor-fingerprint",
     "crates/sensor-active",
+    "crates/sensor-daemon",
+    "crates/sensor-cli",
 ]
 
 [workspace.package]

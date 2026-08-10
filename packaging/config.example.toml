@@ -1,0 +1,140 @@
+# TRAPD Network Sensor — Beispielkonfiguration
+#
+# Ablage: /etc/trapd-sensor/config.toml
+#
+# Jeder Wert hier hat eine Vorgabe; die Datei muss nur enthalten, was davon
+# abweicht. Fehlt sie ganz, laeuft der Sensor mit den Vorgaben: Balanced-Modus,
+# passive Erkennung an, aktive Erkennung aus.
+
+[sensor]
+# Anzeigename im Dashboard. Vorgabe ist der Hostname.
+name = "homelab-sensor-01"
+site = "Keller"
+
+# Betriebsmodus — die lokale Obergrenze dessen, was der Sensor darf:
+#
+#   passive_only  Nur Zuhoeren. Der Sensor sendet kein einziges Paket.
+#                 Richtig fuer SPAN-/Mirror-Ports und fuer Umgebungen, in denen
+#                 jede aktive Probe erklaerungsbeduerftig waere.
+#   balanced      Passiv plus zurueckhaltende aktive Ergaenzung (ICMP,
+#                 TCP-Connect auf einer kurzen Port-Allowlist). Vorgabe.
+#   active        Erweiterte aktive Erkennung: freier Port-Katalog,
+#                 Banner-Grab, SNMP.
+#
+# Wichtig: Das Dashboard kann diesen Wert NICHT anheben. Es steuert nur
+# innerhalb der hier gesetzten Grenze. Ein uebernommenes Backend kann aus einem
+# passive_only-Sensor also keinen Scanner machen.
+mode = "balanced"
+
+state_dir = "/var/lib/trapd-sensor"
+
+[backend]
+api_url = "https://api.trapd.io"
+ingest_url = "https://ingest.trapd.io"
+batch_max_events = 500
+flush_interval_secs = 10
+config_poll_interval_secs = 300
+heartbeat_interval_secs = 60
+request_timeout_secs = 30
+
+[capture]
+# Leer = alle brauchbaren Interfaces automatisch.
+interfaces = []
+# Fuer SPAN-/Mirror-Ports erforderlich. Braucht CAP_NET_ADMIN.
+promiscuous = true
+# Bytes je Paket. Bewusst klein: der Sensor liest Header und ausgewaehlte
+# Klartextfelder, keine Payloads.
+snaplen = 512
+# Aggregationsfenster fuer Flow-Metadaten.
+flow_window_secs = 60
+max_tracked_flows = 50000
+
+[passive]
+arp = true
+dhcp = true
+mdns = true
+ssdp = true
+dns = true
+flows = true
+
+[active]
+# Aktive Erkennung braucht DREI unabhaengige Freigaben: den Modus (oben),
+# `enabled` und `acknowledged`. Fehlt eine davon, wird nichts gesendet.
+enabled = false
+
+# Die bewusste Zusage des Betreibers, dass dieser Host in diesem Netz aktiv
+# sondieren darf. Bleibt absichtlich lokal — das Dashboard kann sie nicht
+# setzen. Ein kopiertes Config-Snippet soll nicht versehentlich in einem
+# fremden Netz scannen.
+acknowledged = false
+
+# LEER BEDEUTET: NICHTS SCANNEN. Der Sensor leitet Ziele nicht aus dem
+# beobachteten Verkehr ab — sonst wuerde ein an einen Uplink gehaengter Sensor
+# fremde Netze anfassen.
+targets = ["192.168.1.0/24"]
+exclude = []
+
+# Probe-Budget ueber alle aktiven Module zusammen.
+rate_limit_per_sec = 5
+
+icmp = true
+tcp_connect = true
+
+# Im Balanced-Modus wird diese Liste zusaetzlich auf die eingebaute Allowlist
+# geschnitten (22, 53, 80, 139, 443, 445, 515, 631, 8080, 8443, 9100).
+ports = [22, 80, 443, 445, 8080, 9100]
+
+# Nur im Active-Modus wirksam.
+banner_grab = false
+
+# Ein vollstaendiger Durchlauf hoechstens alle N Sekunden.
+sweep_interval_secs = 3600
+
+[active.snmp]
+# Nur im Active-Modus wirksam.
+enabled = false
+# Ohne Eintrag hier wird kein SNMP versucht. Der Sensor probiert NIE von sich
+# aus "public"/"private" durch — das waere Credential-Guessing.
+communities = []
+
+[privacy]
+# Die sensibelste Quelle des Sensors: sie zeigt, welche Domains angefragt
+# werden. Komplett abschaltbar, ohne den Rest zu verlieren.
+dns_observation = true
+
+# Query-Namen dieser Domains (Suffix-Match) werden verworfen.
+dns_exclude_domains = []
+
+# Verkehr dieser Hosts/Netze wird gar nicht erst betrachtet — kein Asset,
+# kein Flow, keine DNS-Beobachtung.
+exclude_clients = []
+
+# Aufgeloeste Antwort-IPs mitschicken.
+store_dns_answers = true
+
+# Query-Namen vor dem Senden hashen. Erhaelt die Korrelierbarkeit, ohne den
+# Namen im Klartext zu uebertragen. Das ist Pseudonymisierung, keine
+# Anonymisierung: der Namensraum realer Domains ist klein genug, dass sich ein
+# Hash mit einer Wortliste zurueckrechnen laesst. Wer das nicht will, schaltet
+# dns_observation ab.
+hash_dns_names = false
+
+[buffer]
+dir = "/var/lib/trapd-sensor/queue"
+# Harte Obergrenze. Wird sie erreicht, verwirft der Sensor Events (Flows
+# zuerst, Statusmeldungen zuletzt) statt weiter zu wachsen. Ein Backend-Ausfall
+# darf die Platte nicht volllaufen lassen.
+max_disk_bytes = 268435456   # 256 MiB
+segment_bytes = 8388608      # 8 MiB
+channel_capacity = 10000
+
+[update]
+# Selbsttaetiges Einspielen von Updates. Vorgabe aus; im Dashboard umschaltbar.
+auto_update = false
+channel = "stable"
+check_interval_secs = 21600
+
+[admin]
+# Health, Readiness, Prometheus-Metriken und Status.
+# Loopback und Port > 1024, damit kein CAP_NET_BIND_SERVICE noetig ist.
+listen = "127.0.0.1:9531"
