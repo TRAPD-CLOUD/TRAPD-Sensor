@@ -222,6 +222,9 @@ heartbeat       ─┘       │
 
 ## Entwicklung
 
+Der Workspace hat eine MSRV von Rust/Cargo 1.86. Die eigenen Crates bleiben
+auf Edition 2021; Cargo 1.86 wird für die gesperrten Abhängigkeiten benötigt.
+
 ```bash
 cargo build --workspace
 cargo test  --workspace
