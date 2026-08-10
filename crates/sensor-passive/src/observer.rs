@@ -28,6 +28,7 @@ use crate::frame::{
     parse_ethernet, parse_ipv4, parse_ipv6, parse_tcp, parse_udp, ETHERTYPE_ARP, ETHERTYPE_IPV4,
     ETHERTYPE_IPV6, IP_PROTO_ICMP, IP_PROTO_ICMPV6, IP_PROTO_TCP, IP_PROTO_UDP,
 };
+use crate::icmpv6::{parse_neighbor_discovery, NeighborDiscovery};
 use crate::ssdp::{parse_ssdp, SSDP_PORT};
 
 /// Wie lange dieselbe Aussage nicht erneut gemeldet wird.
@@ -69,6 +70,10 @@ impl PassiveObserver {
         self.packets_seen
     }
 
+    pub fn parser_errors(&self) -> u64 {
+        self.packets_seen.saturating_sub(self.packets_parsed)
+    }
+
     pub fn tracked_flows(&self) -> usize {
         self.flows.tracked_flows()
     }
@@ -91,12 +96,26 @@ impl PassiveObserver {
             }
             ETHERTYPE_IPV4 => {
                 if let Some(ip) = parse_ipv4(frame.payload) {
-                    self.handle_ip(&ip, frame.vlan_id, data.len() as u64, now, &mut out);
+                    self.handle_ip(
+                        &ip,
+                        frame.src_mac,
+                        frame.vlan_id,
+                        data.len() as u64,
+                        now,
+                        &mut out,
+                    );
                 }
             }
             ETHERTYPE_IPV6 => {
                 if let Some(ip) = parse_ipv6(frame.payload) {
-                    self.handle_ip(&ip, frame.vlan_id, data.len() as u64, now, &mut out);
+                    self.handle_ip(
+                        &ip,
+                        frame.src_mac,
+                        frame.vlan_id,
+                        data.len() as u64,
+                        now,
+                        &mut out,
+                    );
                 }
             }
             _ => {}
@@ -163,6 +182,7 @@ impl PassiveObserver {
     fn handle_ip(
         &mut self,
         ip: &crate::frame::IpPacket<'_>,
+        source_mac: [u8; 6],
         vlan_id: Option<u16>,
         frame_bytes: u64,
         now: DateTime<Utc>,
@@ -222,7 +242,19 @@ impl PassiveObserver {
                     now,
                 );
             }
-            IP_PROTO_ICMP | IP_PROTO_ICMPV6 => {
+            IP_PROTO_ICMPV6 => {
+                self.handle_icmpv6(ip, source_mac, vlan_id, now, out);
+                self.record_flow(
+                    ip.src,
+                    0,
+                    ip.dst,
+                    0,
+                    TransportProtocol::Icmp,
+                    frame_bytes,
+                    now,
+                );
+            }
+            IP_PROTO_ICMP => {
                 self.record_flow(
                     ip.src,
                     0,
@@ -234,6 +266,44 @@ impl PassiveObserver {
                 );
             }
             _ => {}
+        }
+    }
+
+    fn handle_icmpv6(
+        &mut self,
+        ip: &crate::frame::IpPacket<'_>,
+        ethernet_mac: [u8; 6],
+        vlan_id: Option<u16>,
+        now: DateTime<Utc>,
+        out: &mut Vec<Observation>,
+    ) {
+        let Some(ndp) = parse_neighbor_discovery(ip.payload) else {
+            return;
+        };
+        let (address, option_mac) = match ndp {
+            NeighborDiscovery::RouterAdvertisement { source_mac } => (ip.src, source_mac),
+            NeighborDiscovery::NeighborSolicitation { source_mac, .. } => (ip.src, source_mac),
+            NeighborDiscovery::NeighborAdvertisement { target, target_mac } => {
+                (IpAddr::V6(target), target_mac)
+            }
+        };
+        // The Ethernet source is authoritative for this frame and is also
+        // available when an NDP sender omits its link-layer option.
+        let mac = option_mac.unwrap_or(ethernet_mac);
+        if address.is_unspecified() || address.is_multicast() || self.is_excluded(address) {
+            return;
+        }
+        let mac = normalize_mac(&mac);
+        if self.suppression.allow(&format!("ndp:{address}:{mac}"), now) {
+            out.push(Observation::Asset(AssetObservation {
+                ip: Some(address),
+                mac: Some(mac),
+                hostname: None,
+                vlan_id,
+                subnet: None,
+                method: DiscoveryMethod::Ndp,
+                interface: Some(self.interface.clone()),
+            }));
         }
     }
 

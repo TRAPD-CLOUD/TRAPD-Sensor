@@ -9,7 +9,7 @@
 //! (kein `CAP_NET_BIND_SERVICE` nötig) und nicht nach außen erreichbar.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +20,7 @@ use crate::state::SensorState;
 /// Wie viele Bytes einer Anfrage überhaupt gelesen werden. Mehr braucht eine
 /// GET-Zeile nicht, und mehr zu lesen wäre ein kostenloser Speicherfresser.
 const MAX_REQUEST_BYTES: usize = 2048;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn serve(
     listen: &str,
@@ -42,12 +43,17 @@ pub async fn serve(
                     Ok((stream, _)) => {
                         let state = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle(stream, state).await {
-                                tracing::debug!(error = %e, "admin request failed");
+                            match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, state)).await {
+                                Ok(Err(e)) => tracing::debug!(error = %e, "admin request failed"),
+                                Err(_) => tracing::debug!("admin request timed out"),
+                                Ok(Ok(())) => {}
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "admin accept failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "admin accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
@@ -82,9 +88,19 @@ pub(crate) fn request_path(request: &str) -> &str {
 
 pub(crate) fn route(path: &str, state: &SensorState) -> (&'static str, &'static str, String) {
     match path {
-        // Liveness: hängt bewusst an nichts. Ein Backend-Ausfall darf keinen
-        // Neustart des Sensors auslösen — der puffert ja gerade fleißig weiter.
-        "/admin/health" => ("200 OK", "text/plain", "ok\n".to_string()),
+        "/admin/health" => {
+            let (health, reason) = state.health();
+            let status = if health == crate::state::HealthState::Unhealthy {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            (
+                status,
+                "text/plain",
+                format!("{}: {reason}\n", health.as_str()),
+            )
+        }
 
         // Readiness: enrolled und mindestens ein Interface im Capture.
         "/admin/ready" => {
@@ -160,12 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn health_is_independent_of_backend_state() {
+    fn health_reports_missing_capture_as_unhealthy() {
         let state = state();
-        // Kein Interface, kein Backend — trotzdem lebendig.
         let (status, _, body) = route("/admin/health", &state);
-        assert_eq!(status, "200 OK");
-        assert_eq!(body.trim(), "ok");
+        assert_eq!(status, "503 Service Unavailable");
+        assert!(body.contains("unhealthy"));
     }
 
     #[test]

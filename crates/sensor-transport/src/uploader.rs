@@ -11,7 +11,7 @@
 //! Ein Absturz mitten im Upload kostet dadurch keine Events, sondern erzeugt
 //! höchstens Doppel — die das Backend über `event_id` abfängt.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,9 @@ pub struct UploaderStats {
     pub upload_discarded: AtomicU64,
     pub batches_sent: AtomicU64,
     pub upload_failures: AtomicU64,
+    pub backend_requests: AtomicU64,
+    pub backend_latency_micros: AtomicU64,
+    pub backend_available: AtomicBool,
     pub queue_pending: AtomicU64,
     pub queue_bytes: AtomicU64,
 }
@@ -93,6 +96,9 @@ impl UploaderStats {
             upload_discarded,
             batches_sent: self.batches_sent.load(Ordering::Relaxed),
             upload_failures: self.upload_failures.load(Ordering::Relaxed),
+            backend_requests: self.backend_requests.load(Ordering::Relaxed),
+            backend_latency_micros: self.backend_latency_micros.load(Ordering::Relaxed),
+            backend_available: self.backend_available.load(Ordering::Relaxed),
             queue_pending: self.queue_pending.load(Ordering::Relaxed),
             queue_bytes: self.queue_bytes.load(Ordering::Relaxed),
         }
@@ -109,6 +115,9 @@ pub struct UploaderStatsSnapshot {
     pub upload_discarded: u64,
     pub batches_sent: u64,
     pub upload_failures: u64,
+    pub backend_requests: u64,
+    pub backend_latency_micros: u64,
+    pub backend_available: bool,
     pub queue_pending: u64,
     pub queue_bytes: u64,
 }
@@ -280,8 +289,19 @@ impl<S: BatchSink> Uploader<S> {
             wire,
         );
 
-        match self.sink.send_batch(payload).await {
+        self.stats.backend_requests.fetch_add(1, Ordering::Relaxed);
+        let request_started = tokio::time::Instant::now();
+        let response = self.sink.send_batch(payload).await;
+        self.stats.backend_latency_micros.store(
+            request_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        match response {
             Ok(response) => {
+                self.stats.backend_available.store(true, Ordering::Relaxed);
                 if let Err(e) = self.queue.commit(&batch) {
                     // Der Batch ist beim Backend angekommen, nur das lokale
                     // Bestätigen scheiterte. Beim nächsten Lauf geht er erneut
@@ -305,6 +325,7 @@ impl<S: BatchSink> Uploader<S> {
             }
 
             Err(err) if err.is_terminal() => {
+                self.stats.backend_available.store(false, Ordering::Relaxed);
                 tracing::error!(
                     error = %err,
                     "uploader: backend rejected this sensor — stopping"
@@ -315,6 +336,7 @@ impl<S: BatchSink> Uploader<S> {
             // Nutzlast wird nie akzeptiert werden: bestätigen und weitermachen,
             // sonst blockiert ein einziger kaputter Batch die gesamte Queue.
             Err(err @ TransportError::BadRequest { .. }) | Err(err @ TransportError::Encode(_)) => {
+                self.stats.backend_available.store(true, Ordering::Relaxed);
                 tracing::error!(
                     error = %err,
                     dropped = count,
@@ -329,6 +351,7 @@ impl<S: BatchSink> Uploader<S> {
             }
 
             Err(err) => {
+                self.stats.backend_available.store(false, Ordering::Relaxed);
                 self.stats.upload_failures.fetch_add(1, Ordering::Relaxed);
                 if let Some(retry_after) = err.retry_after() {
                     self.backoff.override_next(retry_after);

@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --no-default-features --locked
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  package:
+    needs: verify
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            rpm_arch: x86_64
+            linker: gcc
+          - target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
+      - name: Configure linker
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER: ${{ matrix.linker }}
+        run: |
+          key="CARGO_TARGET_${TARGET^^}_LINKER"
+          key="${key//-/_}"
+          echo "$key=$LINKER" >> "$GITHUB_ENV"
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - uses: goreleaser/nfpm-action@v2
+        with:
+          version: v2.41.3
+      - name: Stage binaries
+        run: |
+          mkdir -p dist/bin
+          install -m 0755 target/${{ matrix.target }}/release/trapd-sensord dist/bin/
+          install -m 0755 target/${{ matrix.target }}/release/trapd-sensorctl dist/bin/
+      - name: Build DEB
+        env:
+          PACKAGE_ARCH: ${{ matrix.deb_arch }}
+          BINARY_DIR: dist/bin
+        run: |
+          export PACKAGE_VERSION="${GITHUB_REF_NAME#v}"
+          envsubst < packaging/nfpm.yaml > dist/nfpm-deb.yaml
+          nfpm package --config dist/nfpm-deb.yaml --packager deb --target dist/
+      - name: Build RPM
+        env:
+          PACKAGE_ARCH: ${{ matrix.rpm_arch }}
+          BINARY_DIR: dist/bin
+        run: |
+          export PACKAGE_VERSION="${GITHUB_REF_NAME#v}"
+          envsubst < packaging/nfpm.yaml > dist/nfpm-rpm.yaml
+          nfpm package --config dist/nfpm-rpm.yaml --packager rpm --target dist/
+          rm -f dist/nfpm-*.yaml
+      - run: |
+          mv dist/bin/trapd-sensord dist/trapd-sensord-${{ matrix.target }}
+          mv dist/bin/trapd-sensorctl dist/trapd-sensorctl-${{ matrix.target }}
+          rmdir dist/bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: anchore/sbom-action/download-syft@v0
+      - run: |
+          syft dir:dist -o spdx-json=dist/SBOM.spdx.json
+          (cd dist && sha256sum $(find . -maxdepth 1 -type f -printf '%f\n' | sort) > SHA256SUMS)
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless-sign checksums
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes

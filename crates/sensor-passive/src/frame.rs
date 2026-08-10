@@ -29,6 +29,7 @@ const VLAN_TAG_LEN: usize = 4;
 /// Mehr als zwei Tags (QinQ) ist in der Praxis keine gültige Konstellation,
 /// sondern ein Versuch, den Parser im Kreis laufen zu lassen.
 const MAX_VLAN_TAGS: usize = 2;
+const MAX_IPV6_EXTENSION_HEADERS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthernetFrame<'a> {
@@ -118,18 +119,52 @@ pub fn parse_ipv6(data: &[u8]) -> Option<IpPacket<'_>> {
         return None;
     }
     let payload_len = usize::from(be16(data.get(4..6)?));
-    let next_header = *data.get(6)?;
+    let mut next_header = *data.get(6)?;
     let hop_limit = *data.get(7)?;
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(data.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(data.get(24..40)?).ok()?);
 
     let end = (40 + payload_len).min(data.len());
-    let payload = data.get(40..end)?;
-
-    // Extension-Header werden bewusst nicht aufgelöst: der Sensor braucht
-    // Adressen und, wenn direkt vorhanden, den Transport-Header. Eine
-    // vollständige Header-Kette zu durchlaufen wäre eine eigene Angriffsfläche
-    // für wenig Zusatznutzen.
+    let mut offset = 40usize;
+    for _ in 0..MAX_IPV6_EXTENSION_HEADERS {
+        match next_header {
+            // Hop-by-hop, routing and destination options share this format.
+            0 | 43 | 60 => {
+                next_header = *data.get(offset)?;
+                let len = (usize::from(*data.get(offset + 1)?) + 1).checked_mul(8)?;
+                offset = offset.checked_add(len)?;
+            }
+            // Fragment header. Non-first fragments have no transport header.
+            44 => {
+                next_header = *data.get(offset)?;
+                let fragment = be16(data.get(offset + 2..offset + 4)?) & 0xfff8;
+                if fragment != 0 {
+                    return None;
+                }
+                offset = offset.checked_add(8)?;
+            }
+            // Authentication header length is expressed in 32-bit words minus 2.
+            51 => {
+                next_header = *data.get(offset)?;
+                let len = (usize::from(*data.get(offset + 1)?) + 2).checked_mul(4)?;
+                offset = offset.checked_add(len)?;
+            }
+            59 => {
+                offset = end;
+                break;
+            }
+            _ => break,
+        }
+        if offset > end {
+            return None;
+        }
+    }
+    // If the chain still points at an extension header, the fixed parser limit
+    // was exceeded. Reject rather than ambiguously treating it as payload.
+    if matches!(next_header, 0 | 43 | 44 | 51 | 60) {
+        return None;
+    }
+    let payload = data.get(offset..end)?;
     Some(IpPacket {
         src: IpAddr::V6(src),
         dst: IpAddr::V6(dst),
@@ -390,6 +425,37 @@ mod tests {
         assert_eq!(parsed.dst, "2001:db8::2".parse::<IpAddr>().expect("ip"));
         assert_eq!(parsed.protocol, IP_PROTO_UDP);
         assert_eq!(parsed.payload, &[0xab, 0xcd]);
+    }
+
+    #[test]
+    fn ipv6_walks_a_bounded_extension_chain() {
+        let mut packet = vec![0x60, 0, 0, 0];
+        packet.extend_from_slice(&16u16.to_be_bytes());
+        packet.extend_from_slice(&[0, 64]);
+        packet.extend_from_slice(&[0u8; 32]);
+        // Hop-by-hop -> destination options -> UDP.
+        packet.extend_from_slice(&[60, 0, 0, 0, 0, 0, 0, 0]);
+        packet.extend_from_slice(&[IP_PROTO_UDP, 0, 0, 0, 0, 0, 0, 0]);
+        let parsed = parse_ipv6(&packet).expect("extension chain");
+        assert_eq!(parsed.protocol, IP_PROTO_UDP);
+        assert!(parsed.payload.is_empty());
+    }
+
+    #[test]
+    fn ipv6_rejects_excessive_or_malformed_extensions() {
+        let mut excessive = vec![0x60, 0, 0, 0];
+        excessive.extend_from_slice(&72u16.to_be_bytes());
+        excessive.extend_from_slice(&[0, 64]);
+        excessive.extend_from_slice(&[0u8; 32]);
+        for _ in 0..9 {
+            excessive.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert!(parse_ipv6(&excessive).is_none());
+
+        let mut truncated = excessive[..40].to_vec();
+        truncated[4..6].copy_from_slice(&8u16.to_be_bytes());
+        truncated.extend_from_slice(&[0, 10]);
+        assert!(parse_ipv6(&truncated).is_none());
     }
 
     #[test]

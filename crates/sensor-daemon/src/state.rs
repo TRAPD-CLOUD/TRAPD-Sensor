@@ -12,6 +12,30 @@ use trapd_sensor_transport::UploaderStats;
 
 use crate::admin::Uptime;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthState {
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+impl HealthState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+    fn metric(self) -> u64 {
+        match self {
+            Self::Healthy => 0,
+            Self::Degraded => 1,
+            Self::Unhealthy => 2,
+        }
+    }
+}
+
 pub struct SensorState {
     pub sensor_id: String,
     pub uptime: Uptime,
@@ -22,6 +46,8 @@ pub struct SensorState {
     interfaces_configured: AtomicU64,
     packets_captured: AtomicU64,
     packets_dropped: AtomicU64,
+    capture_bytes: AtomicU64,
+    parser_errors: AtomicU64,
     observations_emitted: AtomicU64,
     devices_tracked: AtomicU64,
     sweeps_completed: AtomicU64,
@@ -30,6 +56,14 @@ pub struct SensorState {
     /// Grund, warum aktive Erkennung aus ist (falls sie es ist).
     active_disabled_reason: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
+    unhealthy: AtomicBool,
+    remote_config_errors: AtomicU64,
+    remote_config_ok: AtomicBool,
+    task_failures: AtomicU64,
+    active_probes: AtomicU64,
+    active_probe_errors: AtomicU64,
+    snmp_queries: AtomicU64,
+    snmp_errors: AtomicU64,
 }
 
 impl SensorState {
@@ -43,6 +77,8 @@ impl SensorState {
             interfaces_configured: AtomicU64::new(0),
             packets_captured: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
+            capture_bytes: AtomicU64::new(0),
+            parser_errors: AtomicU64::new(0),
             observations_emitted: AtomicU64::new(0),
             devices_tracked: AtomicU64::new(0),
             sweeps_completed: AtomicU64::new(0),
@@ -50,6 +86,14 @@ impl SensorState {
             enabled: AtomicBool::new(true),
             active_disabled_reason: Mutex::new(None),
             last_error: Mutex::new(None),
+            unhealthy: AtomicBool::new(false),
+            remote_config_errors: AtomicU64::new(0),
+            remote_config_ok: AtomicBool::new(true),
+            task_failures: AtomicU64::new(0),
+            active_probes: AtomicU64::new(0),
+            active_probe_errors: AtomicU64::new(0),
+            snmp_queries: AtomicU64::new(0),
+            snmp_errors: AtomicU64::new(0),
         }
     }
 
@@ -69,6 +113,12 @@ impl SensorState {
         self.packets_captured.store(captured, Ordering::Relaxed);
         self.packets_dropped.store(dropped, Ordering::Relaxed);
     }
+    pub fn add_capture_bytes(&self, bytes: u64) {
+        self.capture_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub fn set_parser_errors(&self, errors: u64) {
+        self.parser_errors.store(errors, Ordering::Relaxed);
+    }
 
     pub fn add_observations(&self, count: u64) {
         self.observations_emitted
@@ -79,8 +129,16 @@ impl SensorState {
         self.devices_tracked.store(count, Ordering::Relaxed);
     }
 
-    pub fn record_sweep(&self) {
+    pub fn record_sweep(&self, stats: trapd_sensor_active::SweepStats) {
         self.sweeps_completed.fetch_add(1, Ordering::Relaxed);
+        self.active_probes
+            .fetch_add(stats.probes_total as u64, Ordering::Relaxed);
+        self.active_probe_errors
+            .fetch_add(stats.probe_errors as u64, Ordering::Relaxed);
+        self.snmp_queries
+            .fetch_add(stats.snmp_queries as u64, Ordering::Relaxed);
+        self.snmp_errors
+            .fetch_add(stats.snmp_errors as u64, Ordering::Relaxed);
     }
 
     pub fn set_config_version(&self, version: u64) {
@@ -111,6 +169,47 @@ impl SensorState {
         }
     }
 
+    pub fn mark_unhealthy(&self, error: impl Into<String>) {
+        self.unhealthy.store(true, Ordering::Relaxed);
+        self.task_failures.fetch_add(1, Ordering::Relaxed);
+        self.set_last_error(Some(error.into()));
+    }
+
+    pub fn record_remote_config_error(&self) {
+        self.remote_config_errors.fetch_add(1, Ordering::Relaxed);
+        self.remote_config_ok.store(false, Ordering::Relaxed);
+    }
+    pub fn record_remote_config_success(&self) {
+        self.remote_config_ok.store(true, Ordering::Relaxed);
+    }
+
+    pub fn health(&self) -> (HealthState, String) {
+        if self.unhealthy.load(Ordering::Relaxed) {
+            return (
+                HealthState::Unhealthy,
+                self.last_error
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.clone())
+                    .unwrap_or_else(|| "critical subsystem failed".into()),
+            );
+        }
+        if self.interfaces_up.load(Ordering::Relaxed) == 0 {
+            return (HealthState::Unhealthy, "no capture interface is up".into());
+        }
+        let uploader = self.uploader.snapshot();
+        if (uploader.backend_requests > 0 && !uploader.backend_available)
+            || !self.remote_config_ok.load(Ordering::Relaxed)
+            || self.packets_dropped.load(Ordering::Relaxed) > 0
+        {
+            return (
+                HealthState::Degraded,
+                "capture is available, but a recoverable subsystem reports errors".into(),
+            );
+        }
+        (HealthState::Healthy, "ok".into())
+    }
+
     /// Ist der Sensor betriebsbereit? Der Grund gehört zur Antwort — eine
     /// nackte 503 zwingt zum Log-Wühlen.
     pub fn readiness(&self) -> (bool, String) {
@@ -124,7 +223,8 @@ impl SensorState {
                     .into(),
             );
         }
-        (true, "ok".into())
+        let (health, reason) = self.health();
+        (health != HealthState::Unhealthy, reason)
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -137,6 +237,26 @@ impl SensorState {
             ));
         };
 
+        gauge(
+            "trapd_sensor_up",
+            "1 while the daemon state is available.",
+            1,
+        );
+        gauge(
+            "trapd_wal_bytes",
+            "Bytes occupied by the WAL.",
+            uploader.queue_bytes,
+        );
+        gauge(
+            "trapd_wal_records",
+            "Records currently pending in the WAL.",
+            uploader.queue_pending,
+        );
+        gauge(
+            "trapd_sensor_health_state",
+            "Health state: 0 healthy, 1 degraded, 2 unhealthy.",
+            self.health().0.metric(),
+        );
         gauge(
             "trapd_sensor_interfaces_up",
             "Capture interfaces currently receiving packets.",
@@ -177,6 +297,11 @@ impl SensorState {
             "Seconds since the sensor started.",
             self.uptime.secs(),
         );
+        gauge(
+            "trapd_backend_latency_seconds",
+            "Latency of the most recent backend request in seconds.",
+            uploader.backend_latency_micros / 1_000_000,
+        );
 
         let mut counter = |name: &str, help: &str, value: u64| {
             out.push_str(&format!(
@@ -184,6 +309,86 @@ impl SensorState {
             ));
         };
 
+        counter(
+            "trapd_sensor_task_failures_total",
+            "Unexpected critical task failures.",
+            self.task_failures.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_capture_packets_total",
+            "Packets read from capture sockets.",
+            self.packets_captured.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_capture_bytes_total",
+            "Bytes read from capture sockets.",
+            self.capture_bytes.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_capture_kernel_drops_total",
+            "Packets dropped by the capture socket in the kernel.",
+            self.packets_dropped.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_events_generated_total",
+            "Normalized events generated.",
+            self.observations_emitted.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_events_queued_total",
+            "Events accepted by the WAL.",
+            uploader.events_accepted,
+        );
+        counter(
+            "trapd_events_uploaded_total",
+            "Events accepted by the backend.",
+            uploader.events_uploaded,
+        );
+        counter(
+            "trapd_events_dropped_total",
+            "Events evicted or permanently rejected.",
+            uploader.events_dropped,
+        );
+        counter(
+            "trapd_backend_requests_total",
+            "Backend batch requests.",
+            uploader.backend_requests,
+        );
+        counter(
+            "trapd_backend_errors_total",
+            "Backend batch errors.",
+            uploader.upload_failures,
+        );
+        counter(
+            "trapd_active_probes_total",
+            "Active probes attempted.",
+            self.active_probes.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_active_probe_errors_total",
+            "Active probe errors.",
+            self.active_probe_errors.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_snmp_queries_total",
+            "SNMP GET requests attempted.",
+            self.snmp_queries.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_snmp_errors_total",
+            "SNMP request errors.",
+            self.snmp_errors.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_parser_errors_total",
+            "Frames rejected by the passive parser.",
+            self.parser_errors.load(Ordering::Relaxed),
+        );
+        counter(
+            "trapd_task_restarts_total",
+            "Supervised task restarts (restart policy is currently process-level).",
+            0,
+        );
         counter(
             "trapd_sensor_packets_captured_total",
             "Packets read from the capture sockets.",
@@ -226,6 +431,7 @@ impl SensorState {
     pub fn render_status_json(&self) -> String {
         let uploader = self.uploader.snapshot();
         let (ready, reason) = self.readiness();
+        let (health, health_reason) = self.health();
 
         let value = serde_json::json!({
             "sensor_id": self.sensor_id,
@@ -234,6 +440,8 @@ impl SensorState {
             "enabled": self.is_enabled(),
             "ready": ready,
             "readiness_reason": reason,
+            "health": health.as_str(),
+            "health_reason": health_reason,
             "uptime_secs": self.uptime.secs(),
             "config_version": self.config_version(),
             "interfaces": {
@@ -328,7 +536,7 @@ mod tests {
         s.add_observations(12);
         s.add_observations(3);
         s.set_devices_tracked(5);
-        s.record_sweep();
+        s.record_sweep(trapd_sensor_active::SweepStats::default());
 
         let rendered = s.render_prometheus();
         assert!(rendered.contains("trapd_sensor_packets_captured_total 1000"));

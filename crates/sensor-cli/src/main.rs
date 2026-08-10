@@ -9,6 +9,8 @@ use trapd_sensor_core::config::{SensorConfig, DEFAULT_CONFIG_PATH};
 use trapd_sensor_core::identity::{derive_device_id, SensorIdentity};
 use trapd_sensor_transport::{BackendClient, EnrollRequest};
 
+mod diagnose;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "trapd-sensorctl",
@@ -52,7 +54,11 @@ enum Command {
     },
 
     /// Prüft die Konfiguration und die Voraussetzungen auf diesem Host.
-    Diagnose,
+    Diagnose {
+        /// Machine-readable, versioned JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Entfernt die lokale Identität. Der Sensor gilt danach als nicht angemeldet.
     Reset {
@@ -71,8 +77,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = SensorConfig::load(&cli.config)
-        .with_context(|| format!("could not load {}", cli.config.display()))?;
+    let config = match SensorConfig::load(&cli.config) {
+        Ok(config) => config,
+        Err(error) => {
+            if let Command::Diagnose { json } = &cli.command {
+                let report = diagnose::config_failure(&cli.config);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", report.render_text());
+                }
+                std::process::exit(report.exit_code().into());
+            }
+            return Err(error).with_context(|| format!("could not load {}", cli.config.display()));
+        }
+    };
 
     match cli.command {
         Command::Enroll {
@@ -82,7 +101,15 @@ async fn main() -> anyhow::Result<()> {
             force,
         } => enroll(&config, &token, name, site, force).await,
         Command::Status { json } => status(&config, json).await,
-        Command::Diagnose => diagnose(&config),
+        Command::Diagnose { json } => {
+            let report = diagnose::run(&cli.config, &config).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render_text());
+            }
+            std::process::exit(report.exit_code().into());
+        }
         Command::Reset { yes } => reset(&config, yes),
     }
 }
@@ -225,107 +252,6 @@ async fn status(config: &SensorConfig, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Prüft die Voraussetzungen, bevor der Daemon sie im Betrieb entdeckt.
-fn diagnose(config: &SensorConfig) -> anyhow::Result<()> {
-    let mut problems = 0;
-
-    println!("configuration");
-    match config.validate() {
-        Ok(()) => println!("  [ ok ] valid"),
-        Err(e) => {
-            println!("  [fail] {e}");
-            problems += 1;
-        }
-    }
-
-    println!("\nidentity");
-    match SensorIdentity::load(&config.sensor.state_dir) {
-        Ok(identity) => println!(
-            "  [ ok ] enrolled as {} (project {})",
-            identity.sensor_id, identity.project_id
-        ),
-        Err(e) => {
-            println!("  [fail] {e}");
-            println!("         run: trapd-sensorctl enroll --token <ENROLLMENT_TOKEN>");
-            problems += 1;
-        }
-    }
-
-    println!("\ninterfaces");
-    let interfaces = trapd_sensor_capture::list_interfaces();
-    if interfaces.is_empty() {
-        println!("  [fail] none found");
-        problems += 1;
-    }
-    let selected = trapd_sensor_capture::select_interfaces(&config.capture.interfaces);
-    for interface in &interfaces {
-        let marker = if selected.contains(&interface.name) {
-            "*"
-        } else {
-            " "
-        };
-        println!(
-            "  {marker} {:<12} {:<8} {}",
-            interface.name,
-            interface.operstate,
-            interface.mac.as_deref().unwrap_or("-")
-        );
-    }
-    println!("  (* = used for capture)");
-
-    println!("\ncapture permissions");
-    let probe_interface = selected.first().cloned();
-    match probe_interface {
-        Some(interface) => {
-            match trapd_sensor_capture::AfPacketSource::open(
-                &interface,
-                config.capture.promiscuous,
-                Duration::from_millis(50),
-            ) {
-                Ok(_) => println!("  [ ok ] can capture on {interface}"),
-                Err(e) => {
-                    println!("  [fail] {e}");
-                    problems += 1;
-                }
-            }
-        }
-        None => {
-            println!("  [fail] no interface selected");
-            problems += 1;
-        }
-    }
-
-    println!("\nstorage");
-    match std::fs::create_dir_all(&config.buffer.dir) {
-        Ok(()) => println!("  [ ok ] queue directory {}", config.buffer.dir.display()),
-        Err(e) => {
-            println!("  [fail] {} — {e}", config.buffer.dir.display());
-            problems += 1;
-        }
-    }
-
-    println!("\nactive discovery");
-    let policy = config.effective_policy();
-    match (&policy.active, policy.active_disabled_reason) {
-        (Some(active), _) => {
-            println!(
-                "  [ ok ] enabled, {} target network(s), {}/s",
-                active.targets.len(),
-                active.rate_limit_per_sec
-            );
-        }
-        (None, Some(reason)) => println!("  [info] disabled — {reason}"),
-        (None, None) => println!("  [info] disabled"),
-    }
-
-    if problems == 0 {
-        println!("\nall checks passed");
-        Ok(())
-    } else {
-        bail!("{problems} check(s) failed")
-    }
 }
 
 fn reset(config: &SensorConfig, confirmed: bool) -> anyhow::Result<()> {

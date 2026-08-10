@@ -1,0 +1,40 @@
+[package]
+name = "trapd-sensor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+chrono = "0.4"
+trapd-sensor-core = { path = "../crates/sensor-core" }
+trapd-sensor-passive = { path = "../crates/sensor-passive" }
+trapd-sensor-active = { path = "../crates/sensor-active" }
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ipv6_ndp"
+path = "fuzz_targets/ipv6_ndp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "discovery_protocols"
+path = "fuzz_targets/discovery_protocols.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snmp_ber"
+path = "fuzz_targets/snmp_ber.rs"
+test = false
+doc = false
+

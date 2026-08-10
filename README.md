@@ -26,9 +26,10 @@ keine Plattform — er beobachtet und meldet.
 
 **Aktiv** (nur nach ausdrücklicher Freigabe):
 
-- ICMP-Erreichbarkeit
+- ICMP-Erreichbarkeit (IPv4)
 - TCP-Connect auf einem definierten Port-Katalog
 - Banner offener Dienste (nur `active`-Modus)
+- SNMPv2c GET der System-OIDs (nur konfigurierte Communities, kein WALK/SET)
 
 **Was er ausdrücklich nicht tut:** kein Full-Packet-Capture, keine
 Payload-Inspektion, kein SYN-Stealth, kein Erraten von Zugangsdaten, keine
@@ -38,6 +39,10 @@ wie man hineinkommt.
 ---
 
 ## Installation
+
+Supported production platforms are current systemd-based Debian/Ubuntu and
+RHEL/Fedora/Rocky Linux on AMD64 or ARM64. Release assets contain standalone
+binaries plus DEB/RPM packages; see [deployment](docs/deployment.md).
 
 ```bash
 # Paket installieren (siehe packaging/)
@@ -67,6 +72,9 @@ Vor dem ersten Start lohnt sich:
 trapd-sensorctl diagnose     # Konfiguration, Rechte, Interfaces, Speicher
 trapd-sensord --check        # zeigt, was der Sensor mit dieser Config täte
 ```
+
+For automation, `trapd-sensorctl diagnose --json` emits a versioned report and
+uses exit codes 0 (OK), 1 (warnings), 2 (failed checks), and 3 (internal error).
 
 ---
 
@@ -136,6 +144,22 @@ Der Sensor läuft in privaten Netzen. Entsprechend ist er gebaut:
   Namen.
 - **`LOCATION`-URLs aus SSDP werden gemeldet, aber nie abgerufen.**
 - Banner werden auf 256 Byte gekappt und auf druckbares ASCII reduziert.
+
+SNMP is active-mode, read-only v2c GET discovery. Only explicitly configured
+communities are used; the sensor never issues SET/WALK or guesses credentials.
+IPv6 passive discovery supports bounded extension headers and NDP without
+assuming that temporary addresses are stable asset identifiers.
+
+## Betrieb und Fehlerbehebung
+
+- `systemctl status trapd-sensor` and the journal show structured subsystem
+  failures; the package does not start the service before enrollment.
+- `/admin/health` reports healthy/degraded/unhealthy subsystem state;
+  `/admin/ready` indicates whether capture can serve its core purpose.
+- Normal package uninstall preserves sensor identity and queued observations.
+- Detailed guidance: [architecture](docs/architecture.md),
+  [security](docs/security.md), [diagnostics](docs/diagnostics.md), and
+  [release verification](docs/release.md).
 
 ---
 
@@ -220,14 +244,15 @@ Umgesetzt:
 - Enrollment, Bearer-Auth, Batch-Upload, Remote-Config
 - aktive Erkennung: ICMP, TCP-Connect, Banner, Rate-Limit, Scope-Prüfung
 - systemd-Packaging mit Least-Privilege-Härtung
+- IPv6-Extension-Header und passive ICMPv6/NDP-Auswertung
+- defensives, rate-limitiertes SNMPv2c Read-only Discovery
+- CI mit Rustfmt, Clippy, Tests, RustSec, cargo-deny und Cross-Build
 
 Geplant:
 
-- SNMP-Discovery (Konfiguration und Policy sind vorhanden, die Abfrage fehlt)
 - mTLS mit Zertifikatsrotation und Pinning (v0.1 nutzt Bearer-Token)
 - signierter Self-Update-Mechanismus mit Rollback-Schutz
 - eBPF-Capture-Backend für hohe Lasten (heute AF_PACKET mit Userspace-Filter)
-- IPv6-ICMP und NDP-Auswertung
 
 ---
 

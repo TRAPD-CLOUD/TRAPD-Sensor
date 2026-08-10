@@ -76,18 +76,27 @@ fn main() -> anyhow::Result<()> {
         let listen = config.admin.listen.clone();
         let admin_state = state.clone();
         let admin_shutdown = shutdown_rx.clone();
-        let admin =
+        let mut admin =
             tokio::spawn(async move { admin::serve(&listen, admin_state, admin_shutdown).await });
 
+        let signal_shutdown = shutdown_tx.clone();
         let signals = tokio::spawn(async move {
             wait_for_shutdown().await;
-            let _ = shutdown_tx.send(true);
+            let _ = signal_shutdown.send(true);
         });
-
-        let result = daemon.run(shutdown_rx).await;
-
+        let mut daemon = tokio::spawn(daemon.run(shutdown_rx));
+        let result = tokio::select! {
+            result = &mut daemon => result.map_err(anyhow::Error::from)?,
+            result = &mut admin => {
+                let error = match result { Ok(Ok(())) => anyhow::anyhow!("admin server stopped unexpectedly"), Ok(Err(error)) => error, Err(error) => error.into() };
+                state.mark_unhealthy(error.to_string());
+                Err(error)
+            }
+        };
+        let _ = shutdown_tx.send(true);
+        if !daemon.is_finished() { let _ = tokio::time::timeout(std::time::Duration::from_secs(20), &mut daemon).await; }
+        if !admin.is_finished() { let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut admin).await; }
         signals.abort();
-        admin.abort();
         result
     })
 }

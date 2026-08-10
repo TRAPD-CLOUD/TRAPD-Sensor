@@ -420,6 +420,16 @@ impl SensorConfig {
                 "backend.batch_max_events must be > 0".into(),
             ));
         }
+        if self.backend.request_timeout_secs == 0 {
+            return Err(SensorError::Config(
+                "backend.request_timeout_secs must be > 0".into(),
+            ));
+        }
+        if self.buffer.channel_capacity == 0 {
+            return Err(SensorError::Config(
+                "buffer.channel_capacity must be > 0".into(),
+            ));
+        }
         if self.buffer.max_disk_bytes < self.buffer.segment_bytes {
             return Err(SensorError::Config(
                 "buffer.max_disk_bytes must be >= buffer.segment_bytes".into(),
@@ -432,6 +442,16 @@ impl SensorConfig {
             return Err(SensorError::Config(
                 "active.rate_limit_per_sec must be > 0 when active discovery is enabled".into(),
             ));
+        }
+        for community in &self.active.snmp.communities {
+            if community.is_empty()
+                || community.len() > 128
+                || community.chars().any(char::is_control)
+            {
+                return Err(SensorError::Config(
+                    "SNMP communities must contain 1..=128 non-control characters".into(),
+                ));
+            }
         }
         for cidr in self.active.targets.iter().chain(self.active.exclude.iter()) {
             Cidr::parse(cidr).map_err(|e| {
