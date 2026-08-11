@@ -565,6 +565,7 @@ async fn run_fritzbox_session(
     // Only the first bytes of the stream, and only until the decoder proves the
     // stream is real PCAP — captured traffic payloads must never be logged.
     let mut preview: Vec<u8> = Vec::with_capacity(64);
+    let mut header_logged = false;
     let mut observer = PassiveObserver::new(
         format!("fritzbox:{interface_id}"),
         context.policy.clone(),
@@ -598,7 +599,14 @@ async fn run_fritzbox_session(
             let take = (64 - preview.len()).min(chunk.len());
             preview.extend_from_slice(&chunk[..take]);
         }
-        let packets = match decoder.push(&chunk) {
+        let push_result = decoder.push(&chunk);
+        // After push, not before: a single chunk can carry the global header
+        // and the first packet together, in which case the header only
+        // becomes known as a side effect of this push call.
+        if !header_logged {
+            header_logged = trapd_sensor_capture::fritzbox::log_pcap_format_if_known(&decoder);
+        }
+        let packets = match push_result {
             Ok(packets) => packets,
             Err(error) => {
                 context.state.update_fritzbox(|h| h.parser_error_count += 1);
@@ -623,7 +631,7 @@ async fn run_fritzbox_session(
             }
         };
         if let Some(link_type) = decoder.link_type() {
-            if link_type != 1 {
+            if link_type != trapd_sensor_capture::fritzbox::LINKTYPE_ETHERNET {
                 break 'capture Err("unsupported_link_type".into());
             }
         }
@@ -868,7 +876,38 @@ mod fritzbox_tests {
         bytes
     }
 
-    async fn fixture() -> (String, tokio::task::JoinHandle<()>) {
+    /// Global header bytes captured directly from a FRITZ!Box 5590 Fiber's
+    /// own `fritz.box/#/cap` capture UI (`fritzbox-vcc0_11.08.26_1736.eth`),
+    /// independently identified by Linux `file(1)` as "pcap capture file,
+    /// microsecond ts, extensions (little-endian) - version 2.4 (Ethernet,
+    /// capture length 2048)". Confirms this is the real router output, not a
+    /// synthetic approximation — see `docs/fritzbox.md`.
+    fn extended_pcap() -> Vec<u8> {
+        let frame: [u8; 42] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1, 2, 3, 4, 5, 0x08, 0x06, 0, 1, 0x08, 0, 6, 4,
+            0, 2, 0, 1, 2, 3, 4, 5, 192, 168, 1, 2, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1,
+        ];
+        // magic, version_major=2, version_minor=4, thiszone=0, sigfigs=0,
+        // snaplen=2048, linktype=LINKTYPE_ETHERNET.
+        let mut bytes = vec![0x34u8, 0xcd, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend(2048u32.to_le_bytes());
+        bytes.extend(1u32.to_le_bytes());
+        assert_eq!(bytes.len(), 24);
+        // Extended per-record header: ts_sec, ts_usec, incl_len, orig_len,
+        // ifindex, protocol, pkt_type, pad — see PcapVariant::Extended.
+        bytes.extend(1u32.to_le_bytes()); // ts_sec
+        bytes.extend(0u32.to_le_bytes()); // ts_usec
+        bytes.extend((frame.len() as u32).to_le_bytes()); // incl_len
+        bytes.extend((frame.len() as u32).to_le_bytes()); // orig_len
+        bytes.extend(0u32.to_le_bytes()); // ifindex
+        bytes.extend(1u16.to_le_bytes()); // protocol
+        bytes.push(4); // pkt_type
+        bytes.push(0); // pad
+        bytes.extend(frame);
+        bytes
+    }
+
+    async fn fixture(body_for_step_3: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -876,7 +915,7 @@ mod fritzbox_tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = vec![0; 4096];
                 let _ = stream.read(&mut request).await.unwrap();
-                let body=match step {0=>"<SessionInfo><Challenge>12345678</Challenge><SID>0000000000000000</SID></SessionInfo>".as_bytes().to_vec(),1=>"<SessionInfo><SID>0123456789abcdef</SID></SessionInfo>".as_bytes().to_vec(),2=>br#"<input name="capture" value="lan"> LAN"#.to_vec(),_=>pcap()};
+                let body=match step {0=>"<SessionInfo><Challenge>12345678</Challenge><SID>0000000000000000</SID></SessionInfo>".as_bytes().to_vec(),1=>"<SessionInfo><SID>0123456789abcdef</SID></SessionInfo>".as_bytes().to_vec(),2=>br#"<input name="capture" value="lan"> LAN"#.to_vec(),_=>body_for_step_3.clone()};
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -894,9 +933,8 @@ mod fritzbox_tests {
         (format!("http://{address}"), task)
     }
 
-    #[tokio::test]
-    async fn remote_pcap_enters_the_existing_passive_pipeline() {
-        let (address, server) = fixture().await;
+    async fn run_pipeline_test(pcap_bytes: Vec<u8>, max_packet_bytes: usize) {
+        let (address, server) = fixture(pcap_bytes).await;
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("secret");
         SecretStore::new(&secret)
@@ -912,7 +950,7 @@ mod fritzbox_tests {
             credentials_file: secret,
             connect_timeout_secs: 2,
             read_timeout_secs: 2,
-            max_packet_bytes: 64,
+            max_packet_bytes,
         };
         let state = Arc::new(SensorState::new("test".into(), "balanced".into()));
         state.init_fritzbox(config.address.clone(), config.interfaces.clone());
@@ -934,5 +972,20 @@ mod fritzbox_tests {
             1
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_pcap_enters_the_existing_passive_pipeline() {
+        run_pipeline_test(pcap(), 64).await;
+    }
+
+    /// Regression test for the real FRITZ!Box compatibility bug: a genuine
+    /// router capture using the extended/Kuznetsov-modified pcap variant
+    /// (magic `34 cd b2 a1`) must decode and reach the passive pipeline the
+    /// same way a standard-variant capture does — previously this failed
+    /// with "invalid PCAP stream".
+    #[tokio::test]
+    async fn remote_extended_pcap_enters_the_existing_passive_pipeline() {
+        run_pipeline_test(extended_pcap(), 2048).await;
     }
 }

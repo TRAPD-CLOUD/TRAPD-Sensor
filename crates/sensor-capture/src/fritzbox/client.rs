@@ -1,4 +1,4 @@
-use super::{challenge_response, AuthError, CaptureInterface, Credentials};
+use super::{challenge_response, AuthError, CaptureInterface, Credentials, PcapStreamDecoder};
 use reqwest::{header::CONTENT_TYPE, redirect::Policy, StatusCode, Url};
 use scraper::{ElementRef, Html, Selector};
 use std::time::Duration;
@@ -324,12 +324,44 @@ pub fn classify_non_pcap(content_type: &str, bytes: &[u8]) -> String {
         return "response body starts with '<' — likely HTML/XML, not a PCAP stream".to_owned();
     }
     match bytes.get(0..4) {
+        // d4c3b2a1 / a1b2c3d4: standard pcap. 4d3cb2a1 / a1b23c4d: nanosecond
+        // pcap. 34cdb2a1 / a1b2cd34: the Kuznetsov-modified/"extended"
+        // variant FRITZ!OS itself emits (see `PcapVariant::Extended`) — a
+        // real, supported format, not evidence of HTTP or stream corruption.
         Some(magic) => format!(
-            "unexpected magic bytes {:02x} {:02x} {:02x} {:02x} (expected d4c3b2a1 / a1b2c3d4, or the nanosecond variants)",
+            "unexpected magic bytes {:02x} {:02x} {:02x} {:02x} (expected d4c3b2a1 / a1b2c3d4, 4d3cb2a1 / a1b23c4d, or 34cdb2a1 / a1b2cd34)",
             magic[0], magic[1], magic[2], magic[3]
         ),
         None => "stream ended before a PCAP global header could be read".to_owned(),
     }
+}
+
+/// Logs a one-time debug summary of the parsed PCAP format, once the global
+/// header is known. Returns whether it logged, so a caller in a streaming
+/// loop can stop calling this once `true`. Only header-level metadata is
+/// logged (variant/endian/timestamp precision/link type/snaplen) — never
+/// captured traffic bytes, preserving the same privacy invariant as the rest
+/// of this module.
+pub fn log_pcap_format_if_known(decoder: &PcapStreamDecoder) -> bool {
+    let (Some(variant), Some(endian), Some(precision), Some(link_type), Some(snaplen)) = (
+        decoder.variant(),
+        decoder.endian(),
+        decoder.timestamp_precision(),
+        decoder.link_type(),
+        decoder.snaplen(),
+    ) else {
+        return false;
+    };
+    tracing::debug!(
+        target: "trapd_sensor_capture",
+        variant = %variant,
+        endian = %endian,
+        timestamp = %precision,
+        linktype = link_type,
+        snaplen = snaplen,
+        "PCAP format detected"
+    );
+    true
 }
 
 async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
