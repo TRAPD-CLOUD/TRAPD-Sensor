@@ -297,7 +297,7 @@ else
       printf '\n' >&3
       exec 3>&-
     else
-      warn "no enrollment token and no terminal to prompt on — skipping enrollment. Run 'trapd-sensorctl enroll --token <TOKEN>' as the trapd-sensor user once you have one."
+      warn "no enrollment token and no terminal to prompt on — skipping enrollment. Re-run this installer once you have one (it will prompt), or set TRAPD_ENROLLMENT_TOKEN and run 'trapd-sensorctl enroll' as the trapd-sensor user — avoid 'enroll --token', which exposes it in argv/history."
     fi
   fi
 
@@ -309,7 +309,7 @@ else
     # `enroll --token` already reads via clap's env fallback), not argv —
     # see as_sensor_with_token's doc comment.
     if ! as_sensor_with_token "$TOKEN" "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
-      die "enrollment failed (see the error above — usually an expired/invalid token or an unreachable backend.api_url in ${CONFIG_DIR}/config.toml). Everything else is installed; fix the cause and re-run: sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+      die "enrollment failed (see the error above — usually an expired/invalid token or an unreachable backend.api_url in ${CONFIG_DIR}/config.toml). Everything else is installed; fix the cause and re-run this installer (sudo bash install.sh) once you have a valid token."
     fi
   fi
 fi
@@ -331,12 +331,12 @@ if [[ "$SKIP_ENROLL" -eq 0 && -f "${STATE_DIR}/identity.json" ]]; then
 elif [[ "$SKIP_ENROLL" -eq 1 ]]; then
   log "not starting the service (--skip-enroll)."
   echo "Enroll and start it with:"
-  echo "  sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+  echo "  sudo bash install.sh   # re-run this installer; it prompts for the token (hidden input)"
   echo "  sudo systemctl enable --now trapd-sensor"
 else
   log "not starting the service — the sensor is installed but not enrolled yet."
   echo "Enroll and start it with:"
-  echo "  sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+  echo "  sudo bash install.sh   # re-run this installer; it prompts for the token (hidden input)"
   echo "  sudo systemctl enable --now trapd-sensor"
 fi
 
