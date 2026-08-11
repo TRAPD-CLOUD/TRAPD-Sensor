@@ -64,9 +64,13 @@ jobs:
           key="${key//-/_}"
           echo "$key=$LINKER" >> "$GITHUB_ENV"
       - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
-      - uses: goreleaser/nfpm-action@v2
-        with:
-          version: v2.41.3
+      - name: Install nfpm
+        # goreleaser/nfpm-action was removed from the Marketplace; install
+        # from goreleaser's own apt repo instead.
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update
+          sudo apt-get install -y nfpm
       - name: Stage binaries
         run: |
           mkdir -p dist/bin
