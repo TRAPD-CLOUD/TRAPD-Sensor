@@ -47,6 +47,22 @@ WORKDIR=""
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m warning:\033[0m %s\n' "$*" >&2; }
+
+# Runs a command as the trapd-sensor service user. The script already
+# requires real root (checked below), so this only needs *some* way to
+# drop privileges, not sudo specifically — minimal server/container images
+# often don't ship sudo at all. Prefers runuser (util-linux, effectively
+# always present on a systemd host) over sudo, falls back to su.
+as_sensor() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u trapd-sensor -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u trapd-sensor "$@"
+  else
+    su -s /bin/sh trapd-sensor -c "$(printf '%q ' "$@")"
+  fi
+}
+
 # die() is for expected, already-explained failures (bad args, missing
 # prerequisites, a rejected token) — the message alone is the whole story,
 # so it disables the ERR trap first to avoid a second, generic "something
@@ -63,7 +79,15 @@ on_err() {
 trap 'on_err $LINENO' ERR
 
 cleanup() {
-  [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
+  # Must always return 0: this runs from the EXIT trap, and with -E
+  # (errtrace) an ERR trap still fires for a failing command inside a
+  # function called from another trap — a bare `[[ ... ]] && rm -rf` whose
+  # condition is false (e.g. --help exits before WORKDIR is ever set) would
+  # itself "fail", triggering on_err and turning a clean `exit 0` into 1.
+  if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+  return 0
 }
 trap cleanup EXIT
 
@@ -218,8 +242,12 @@ install -m 0644 -o root -g root "$WORKDIR/packaging/config.example.toml" "${CONF
 # access to the default via ReadWritePaths=, but an operator's config.toml
 # could still name a different (writable) path, and enrollment/start
 # decisions below must agree with where trapd-sensorctl actually put the
-# identity file.
-configured_state_dir="$(sed -n 's/^state_dir *= *"\(.*\)"/\1/p' "${CONFIG_DIR}/config.toml" | head -1)"
+# identity file. Read it via the real config parser (--check) rather than
+# a bash TOML regex, so any valid TOML (indentation, quoting, comments)
+# the binaries themselves accept is resolved correctly instead of drifting
+# from their parser.
+configured_state_dir="$("${BIN_DIR}/trapd-sensord" --config "${CONFIG_DIR}/config.toml" --check 2>/dev/null \
+  | sed -n 's/^ *state directory: *//p' | head -1)"
 [[ -n "$configured_state_dir" ]] && STATE_DIR="$configured_state_dir"
 
 # --- Enroll --------------------------------------------------------------
@@ -251,7 +279,7 @@ else
     log "enrolling with the TRAPD backend"
     ENROLL_ARGS=(enroll --token "$TOKEN")
     [[ "$FORCE_ENROLL" -eq 1 ]] && ENROLL_ARGS+=(--force)
-    if ! sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
+    if ! as_sensor "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
       die "enrollment failed (see the error above — usually an expired/invalid token or an unreachable backend.api_url in ${CONFIG_DIR}/config.toml). Everything else is installed; fix the cause and re-run: sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
     fi
   fi
@@ -270,7 +298,7 @@ if [[ "$SKIP_ENROLL" -eq 0 && -f "${STATE_DIR}/identity.json" ]]; then
   fi
   sleep 1
   echo
-  sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" status || warn "status check failed — the service may still be starting; try 'trapd-sensorctl status' again in a few seconds."
+  as_sensor "${BIN_DIR}/trapd-sensorctl" status || warn "status check failed — the service may still be starting; try 'trapd-sensorctl status' again in a few seconds."
 elif [[ "$SKIP_ENROLL" -eq 1 ]]; then
   log "not starting the service (--skip-enroll)."
   echo "Enroll and start it with:"
@@ -285,7 +313,7 @@ fi
 
 echo
 log "running diagnostics"
-sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" diagnose || true
+as_sensor "${BIN_DIR}/trapd-sensorctl" diagnose || true
 
 echo
 log "done. 'systemctl status trapd-sensor' and 'journalctl -u trapd-sensor -f' for logs."
