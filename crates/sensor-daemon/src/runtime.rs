@@ -556,9 +556,11 @@ async fn run_fritzbox_session(
             tracing::warn!(interface = interface_id, error = %error, "FRITZ!Box capture endpoint failed");
             "capture_endpoint_failed".to_string()
         })?;
-    let response_diagnostic =
-        trapd_sensor_capture::fritzbox::describe_capture_response(&response);
-    tracing::debug!(interface = interface_id, response = %response_diagnostic, "FRITZ!Box capture response received");
+    let response_diagnostic = trapd_sensor_capture::fritzbox::describe_capture_response(&response);
+    // `target` pinned to the capture crate so `RUST_LOG=trapd_sensor_capture=debug`
+    // (the documented way to see capture diagnostics) enables this line too,
+    // even though it is logged from the daemon crate.
+    tracing::debug!(target: "trapd_sensor_capture", interface = interface_id, response = %response_diagnostic, "FRITZ!Box capture response received");
     let mut decoder = PcapStreamDecoder::new(config.max_packet_bytes);
     // Only the first bytes of the stream, and only until the decoder proves the
     // stream is real PCAP — captured traffic payloads must never be logged.
@@ -612,6 +614,7 @@ async fn run_fritzbox_session(
                     "FRITZ!Box capture stream did not decode as PCAP"
                 );
                 tracing::debug!(
+                    target: "trapd_sensor_capture",
                     interface = interface_id,
                     preview = %trapd_sensor_capture::fritzbox::preview_stream_bytes(&preview),
                     "FRITZ!Box capture stream preview"
