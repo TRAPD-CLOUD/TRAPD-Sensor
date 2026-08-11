@@ -73,6 +73,13 @@ flush_interval_secs = 10
 config_poll_interval_secs = 300
 heartbeat_interval_secs = 60
 request_timeout_secs = 30
+# Klartext-HTTP ist sonst nur fuer Loopback erlaubt. Auf true setzen, um es
+# zusaetzlich fuer ein RFC1918-privates Ziel zu erlauben (10.0.0.0/8,
+# 172.16.0.0/12, 192.168.0.0/16) — fuer einen selbstgehosteten Homelab-Test-
+# Backend ohne TLS. `trapd-sensorctl setup` setzt das automatisch, wenn eine
+# private IP als Backend-Host eingegeben wird. Ein oeffentliches Ziel bleibt
+# in jedem Fall abgelehnt.
+allow_insecure_private_http = false
 
 [capture]
 # Leer = alle brauchbaren Interfaces automatisch.

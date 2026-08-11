@@ -58,6 +58,11 @@ struct Plan {
     fritzbox_enabled: bool,
     fritzbox_address: String,
     fritzbox_interfaces: Vec<String>,
+    /// `None` = leave `[backend]` in the file untouched. Only set when the
+    /// operator actively enters a host this run — see `backend_urls_for_host`.
+    backend_api_url: Option<String>,
+    backend_ingest_url: Option<String>,
+    backend_allow_insecure_private_http: Option<bool>,
 }
 
 impl Plan {
@@ -73,6 +78,9 @@ impl Plan {
             fritzbox_enabled: config.capture.fritzbox.enabled,
             fritzbox_address: config.capture.fritzbox.address.clone(),
             fritzbox_interfaces: config.capture.fritzbox.interfaces.clone(),
+            backend_api_url: None,
+            backend_ingest_url: None,
+            backend_allow_insecure_private_http: None,
         }
     }
 
@@ -91,8 +99,53 @@ impl Plan {
         preview.capture.fritzbox.enabled = self.fritzbox_enabled;
         preview.capture.fritzbox.address = self.fritzbox_address.clone();
         preview.capture.fritzbox.interfaces = self.fritzbox_interfaces.clone();
+        if let Some(api_url) = &self.backend_api_url {
+            preview.backend.api_url = api_url.clone();
+        }
+        if let Some(ingest_url) = &self.backend_ingest_url {
+            preview.backend.ingest_url = ingest_url.clone();
+        }
+        if let Some(allow) = self.backend_allow_insecure_private_http {
+            preview.backend.allow_insecure_private_http = allow;
+        }
         preview
     }
+}
+
+/// Turns a bare host/IP entered during setup into the two backend URLs
+/// TRAPD-Sensor needs, using the documented default ports (dashboard 3001,
+/// ingest-gateway 8082) — matching the local Homelab Docker Compose layout
+/// in `docker-compose.yml` of the main TRAPD repo. Returns
+/// `(api_url, ingest_url, allow_insecure_private_http)`.
+///
+/// Only a bare host/IP (no scheme, e.g. `10.0.0.22`) is handled — a value
+/// containing "://" is left alone (returns `None`) for the operator to set
+/// by hand in `config.toml`, matching the deliberately small scope of what
+/// `setup` writes. A private (RFC1918) or loopback host gets `http://` with
+/// the third value set accordingly (`allow_insecure_private_http` is only
+/// ever `true` for a private, non-loopback host — loopback is always
+/// allowed regardless of that flag); anything else gets `https://` and
+/// `false`, since only RFC1918/loopback plaintext is ever permitted.
+fn backend_urls_for_host(host: &str) -> Option<(String, String, bool)> {
+    let host = host.trim();
+    if host.is_empty() || host.contains("://") {
+        return None;
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let private = !loopback
+        && matches!(
+            host.parse::<std::net::IpAddr>(),
+            Ok(std::net::IpAddr::V4(v4)) if v4.is_private()
+        );
+    let scheme = if loopback || private { "http" } else { "https" };
+    Some((
+        format!("{scheme}://{host}:3001"),
+        format!("{scheme}://{host}:8082"),
+        private,
+    ))
 }
 
 pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> anyhow::Result<()> {
@@ -250,6 +303,25 @@ pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> 
                 plan.vantage,
                 config_path.display()
             ),
+        }
+    }
+
+    // --- Backend address (optional; for a local/self-hosted test backend) -----
+    // Deliberately minimal: a bare host generates both URLs with the
+    // documented default ports, skipped entirely for non-interactive runs
+    // and left alone (no [backend] keys written) if the operator just
+    // presses enter — config.toml keeps whatever it already had.
+    if let Some(prompt) = prompt.as_mut() {
+        prompt.say(&format!(
+            "\nBackend host or IP, for a local/self-hosted test backend \
+             (leave blank to keep {}): ",
+            config.backend.api_url
+        ));
+        let input = prompt.read_line()?;
+        if let Some((api_url, ingest_url, allow_insecure)) = backend_urls_for_host(&input) {
+            plan.backend_api_url = Some(api_url);
+            plan.backend_ingest_url = Some(ingest_url);
+            plan.backend_allow_insecure_private_http = Some(allow_insecure);
         }
     }
 
@@ -754,6 +826,22 @@ fn update_document(document: &mut DocumentMut, plan: &Plan) -> anyhow::Result<()
         remote_interfaces.push(id.as_str());
     }
     fritzbox["interfaces"] = value(remote_interfaces);
+
+    if plan.backend_api_url.is_some()
+        || plan.backend_ingest_url.is_some()
+        || plan.backend_allow_insecure_private_http.is_some()
+    {
+        let backend = ensure_table(document, "backend", "")?;
+        if let Some(api_url) = &plan.backend_api_url {
+            backend["api_url"] = value(api_url.as_str());
+        }
+        if let Some(ingest_url) = &plan.backend_ingest_url {
+            backend["ingest_url"] = value(ingest_url.as_str());
+        }
+        if let Some(allow) = plan.backend_allow_insecure_private_http {
+            backend["allow_insecure_private_http"] = value(allow);
+        }
+    }
     Ok(())
 }
 
@@ -1042,6 +1130,9 @@ mod tests {
             fritzbox_enabled: false,
             fritzbox_address: "fritz.box".into(),
             fritzbox_interfaces: Vec::new(),
+            backend_api_url: None,
+            backend_ingest_url: None,
+            backend_allow_insecure_private_http: None,
         }
     }
 
@@ -1331,5 +1422,89 @@ mod tests {
             Some(trapd_sensor_core::visibility::VisibilityLevel::Full)
         );
         assert!(report.render_summary().contains("Managed Switch / SPAN"));
+    }
+
+    #[test]
+    fn bare_private_ip_generates_http_urls_with_the_insecure_flag() {
+        assert_eq!(
+            backend_urls_for_host("10.0.0.22"),
+            Some((
+                "http://10.0.0.22:3001".to_string(),
+                "http://10.0.0.22:8082".to_string(),
+                true,
+            ))
+        );
+    }
+
+    #[test]
+    fn bare_loopback_host_generates_http_urls_without_the_insecure_flag() {
+        // Loopback is always allowed by validate() regardless of the flag,
+        // so setup should not need to set it just to reach 127.0.0.1.
+        assert_eq!(
+            backend_urls_for_host("127.0.0.1"),
+            Some((
+                "http://127.0.0.1:3001".to_string(),
+                "http://127.0.0.1:8082".to_string(),
+                false,
+            ))
+        );
+        assert_eq!(
+            backend_urls_for_host("localhost"),
+            Some((
+                "http://localhost:3001".to_string(),
+                "http://localhost:8082".to_string(),
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn bare_public_host_generates_https_urls() {
+        assert_eq!(
+            backend_urls_for_host("sensors.example.com"),
+            Some((
+                "https://sensors.example.com:3001".to_string(),
+                "https://sensors.example.com:8082".to_string(),
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn blank_or_full_url_input_leaves_backend_untouched() {
+        assert_eq!(backend_urls_for_host(""), None);
+        assert_eq!(backend_urls_for_host("   "), None);
+        assert_eq!(backend_urls_for_host("https://api.trapd.io"), None);
+    }
+
+    #[test]
+    fn setup_input_10_0_0_22_produces_the_expected_config() {
+        let mut doc = document("[sensor]\nname = \"a\"\n");
+        let (api_url, ingest_url, allow) = backend_urls_for_host("10.0.0.22").expect("private ip");
+        let plan = Plan {
+            backend_api_url: Some(api_url),
+            backend_ingest_url: Some(ingest_url),
+            backend_allow_insecure_private_http: Some(allow),
+            ..plan()
+        };
+        update_document(&mut doc, &plan).expect("update");
+
+        let parsed: SensorConfig = toml::from_str(&doc.to_string()).expect("parses");
+        assert_eq!(parsed.backend.api_url, "http://10.0.0.22:3001");
+        assert_eq!(parsed.backend.ingest_url, "http://10.0.0.22:8082");
+        assert!(parsed.backend.allow_insecure_private_http);
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn skipping_the_backend_prompt_leaves_existing_backend_config_untouched() {
+        let mut doc = document(
+            "[sensor]\nname = \"a\"\n\n[backend]\napi_url = \"https://api.trapd.io\"\ningest_url = \"https://ingest.trapd.io\"\n",
+        );
+        update_document(&mut doc, &plan()).expect("update");
+        let parsed: SensorConfig = toml::from_str(&doc.to_string()).expect("parses");
+        assert_eq!(parsed.backend.api_url, "https://api.trapd.io");
+        assert_eq!(parsed.backend.ingest_url, "https://ingest.trapd.io");
+        assert!(!parsed.backend.allow_insecure_private_http);
     }
 }

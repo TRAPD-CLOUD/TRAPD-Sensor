@@ -143,6 +143,12 @@ pub struct BackendConfig {
     /// Optionale SHA-256-Pins der akzeptierten CA-Zertifikate (Base64/Hex).
     /// Leer = normale Systemvertrauenskette.
     pub tls_ca_pins_sha256: Vec<String>,
+    /// Erlaubt Klartext-HTTP zusätzlich für RFC1918-private Adressen
+    /// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) — für lokale
+    /// Homelab-Tests gegen einen selbstgehosteten Backend-Host ohne TLS.
+    /// Loopback ist davon unabhängig immer erlaubt. Default `false`: ein
+    /// öffentliches Klartext-Ziel bleibt in jedem Fall abgelehnt.
+    pub allow_insecure_private_http: bool,
 }
 
 impl Default for BackendConfig {
@@ -156,6 +162,7 @@ impl Default for BackendConfig {
             heartbeat_interval_secs: 60,
             request_timeout_secs: 30,
             tls_ca_pins_sha256: Vec::new(),
+            allow_insecure_private_http: false,
         }
     }
 }
@@ -447,11 +454,17 @@ impl SensorConfig {
             ));
         }
         // Klartext-HTTP würde Sensor-Secret und Telemetrie offenlegen. Für lokale
-        // Entwicklung bleibt Loopback erlaubt, sonst ist TLS Pflicht.
+        // Entwicklung bleibt Loopback erlaubt, sonst ist TLS Pflicht — außer der
+        // Betreiber hat allow_insecure_private_http für ein RFC1918-privates Ziel
+        // (Homelab-Test gegen einen selbstgehosteten Host) explizit gesetzt.
         for url in [&self.backend.api_url, &self.backend.ingest_url] {
-            if url.starts_with("http://") && !is_loopback_url(url) {
+            let allowed_plaintext = is_loopback_url(url)
+                || (self.backend.allow_insecure_private_http && is_private_ipv4_url(url));
+            if url.starts_with("http://") && !allowed_plaintext {
                 return Err(SensorError::Config(format!(
-                    "refusing plaintext HTTP backend url {url} — use https:// (loopback is exempt)"
+                    "refusing plaintext HTTP backend url {url} — use https:// (loopback is exempt; \
+                     set backend.allow_insecure_private_http = true to also allow RFC1918 \
+                     private addresses)"
                 )));
             }
         }
@@ -533,22 +546,33 @@ impl SensorConfig {
     }
 }
 
-fn is_loopback_url(url: &str) -> bool {
+fn url_host(url: &str) -> &str {
     let rest = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let host = rest
-        .split('/')
+    rest.split('/')
         .next()
         .unwrap_or("")
         .rsplit_once(':')
         .map(|(h, _)| h)
-        .unwrap_or_else(|| rest.split('/').next().unwrap_or(""));
+        .unwrap_or_else(|| rest.split('/').next().unwrap_or(""))
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let host = url_host(url);
     host == "localhost"
         || host
             .parse::<IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false)
+}
+
+/// RFC1918 private IPv4 ranges only (10.0.0.0/8, 172.16.0.0/12,
+/// 192.168.0.0/16), and only as an IP literal — a hostname is never treated
+/// as private, since that would need a DNS lookup this synchronous validator
+/// does not perform.
+fn is_private_ipv4_url(url: &str) -> bool {
+    matches!(url_host(url).parse::<IpAddr>(), Ok(IpAddr::V4(v4)) if v4.is_private())
 }
 
 // ---------------------------------------------------------------------------
@@ -969,6 +993,52 @@ mod tests {
         cfg.backend.api_url = "http://127.0.0.1:8080".into();
         cfg.backend.ingest_url = "http://localhost:8082".into();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn private_http_rejected_when_flag_is_false() {
+        let mut cfg = SensorConfig::default();
+        cfg.backend.allow_insecure_private_http = false;
+        cfg.backend.api_url = "http://10.0.0.22:3001".into();
+        cfg.backend.ingest_url = "http://10.0.0.22:8082".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn private_http_accepted_when_flag_is_true() {
+        let mut cfg = SensorConfig::default();
+        cfg.backend.allow_insecure_private_http = true;
+        for host in ["10.0.0.22", "172.16.5.1", "192.168.1.50"] {
+            cfg.backend.api_url = format!("http://{host}:3001");
+            cfg.backend.ingest_url = format!("http://{host}:8082");
+            assert!(cfg.validate().is_ok(), "{host} should be accepted");
+        }
+    }
+
+    #[test]
+    fn public_http_still_rejected_even_with_flag_set() {
+        let mut cfg = SensorConfig::default();
+        cfg.backend.allow_insecure_private_http = true;
+        cfg.backend.api_url = "http://api.trapd.io".into();
+        cfg.backend.ingest_url = "http://ingest.trapd.io".into();
+        assert!(cfg.validate().is_err());
+
+        // A public IP address must be rejected the same way a public
+        // hostname is — the allowance is RFC1918-only, not "any http://".
+        cfg.backend.api_url = "http://8.8.8.8:3001".into();
+        cfg.backend.ingest_url = "http://8.8.8.8:8082".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn https_backend_still_accepted_regardless_of_flag() {
+        for flag in [false, true] {
+            let mut cfg = SensorConfig::default();
+            cfg.backend.allow_insecure_private_http = flag;
+            cfg.backend.api_url = "https://api.trapd.io".into();
+            cfg.backend.ingest_url = "https://ingest.trapd.io".into();
+            assert!(cfg.validate().is_ok());
+        }
     }
 
     #[test]
