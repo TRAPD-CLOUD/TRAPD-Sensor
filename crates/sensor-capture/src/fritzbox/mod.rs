@@ -12,8 +12,8 @@ mod secrets;
 
 pub use auth::{challenge_response, AuthError, ChallengeKind};
 pub use client::{
-    classify_non_pcap, describe_capture_response, preview_stream_bytes,
-    CaptureResponseDiagnostic, FritzBoxClient, FritzBoxError, FritzBoxSession,
+    classify_non_pcap, describe_capture_response, preview_stream_bytes, CaptureResponseDiagnostic,
+    FritzBoxClient, FritzBoxError, FritzBoxSession,
 };
 pub use pcap::{Endianness, PcapError, PcapPacket, PcapStreamDecoder};
 pub use secrets::{Credentials, SecretError, SecretStore};
