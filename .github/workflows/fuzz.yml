@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        target: [packet, ipv6_ndp, discovery_protocols, snmp_ber]
+        target: [packet, ipv6_ndp, discovery_protocols, snmp_ber, pcap_stream]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

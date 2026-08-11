@@ -11,6 +11,32 @@ and records and rejects malformed lengths before allocating packet storage.
 Decoded frames are intended for the ordinary passive packet pipeline; full
 payloads must never enter the WAL, database, events, or logs.
 
+### PCAP format: standard and extended
+
+Some FRITZ!OS versions and capture interfaces emit **classic pcap with the
+`0xa1b2cd34` magic** (bytes `34 cd b2 a1` on a little-endian router) instead
+of the usual `0xa1b2c3d4`. This is not corrupted or truncated pcap, an HTTP
+transport bug, or evidence of stream/chunk-framing corruption — it is a real,
+if old, libpcap-compatible format: **Alexey Kuznetsov's modified libpcap
+record format** (`KUZNETZOV_TCPDUMP_MAGIC` in libpcap's own `sf-pcap.c`),
+historically emitted by patched libpcap builds such as Red Hat 6.1/6.2's, and
+apparently still bundled in FRITZ!OS's own tcpdump/libpcap. A capture taken
+directly from the router's `fritz.box/#/cap` UI and independently checked
+with `file(1)` confirms this: `pcap capture file, microsecond ts, extensions
+(little-endian) - version 2.4`. TRAPD's decoder (`PcapVariant::Extended`)
+supports this format alongside standard and nanosecond-precision pcap, both
+little- and big-endian; see the doc comments on `PcapVariant` in
+`crates/sensor-capture/src/fritzbox/pcap.rs` for the exact verified
+global-header and per-record layouts and their sourcing. Downstream code
+(`sensor-cli`, `sensor-daemon`, `PassiveObserver`) needs no variant-specific
+handling — the decoder always outputs the same decoded-Ethernet-frame
+abstraction regardless of which pcap variant produced it.
+
+With capture debug logging enabled (see below), a successful capture logs
+which variant, endianness, timestamp precision, link type, and snaplen were
+detected, e.g. `variant=extended endian=little timestamp=microseconds
+linktype=1 snaplen=2048`.
+
 ## Credentials and threat model
 
 Configuration contains only the secret path. The username and password are in

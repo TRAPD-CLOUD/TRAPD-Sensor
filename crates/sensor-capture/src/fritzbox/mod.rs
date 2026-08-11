@@ -12,10 +12,13 @@ mod secrets;
 
 pub use auth::{challenge_response, AuthError, ChallengeKind};
 pub use client::{
-    classify_non_pcap, describe_capture_response, preview_stream_bytes, CaptureResponseDiagnostic,
-    FritzBoxClient, FritzBoxError, FritzBoxSession,
+    classify_non_pcap, describe_capture_response, log_pcap_format_if_known, preview_stream_bytes,
+    CaptureResponseDiagnostic, FritzBoxClient, FritzBoxError, FritzBoxSession,
 };
-pub use pcap::{Endianness, PcapError, PcapPacket, PcapStreamDecoder};
+pub use pcap::{
+    Endianness, ExtendedRecordMeta, PcapError, PcapPacket, PcapStreamDecoder, PcapVariant,
+    TimestampPrecision, LINKTYPE_ETHERNET,
+};
 pub use secrets::{Credentials, SecretError, SecretStore};
 
 /// A capture source returned by FRITZ!OS discovery. IDs are opaque and must be

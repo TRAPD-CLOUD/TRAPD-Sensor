@@ -446,6 +446,7 @@ async fn validate_capture(
     // Only the first bytes of the stream, and only until the decoder proves the
     // stream is real PCAP — captured traffic payloads must never be logged.
     let mut preview: Vec<u8> = Vec::with_capacity(64);
+    let mut header_logged = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         let chunk = tokio::time::timeout_at(deadline, response.chunk())
@@ -457,9 +458,14 @@ async fn validate_capture(
             let take = (64 - preview.len()).min(chunk.len());
             preview.extend_from_slice(&chunk[..take]);
         }
+        if !header_logged {
+            header_logged = trapd_sensor_capture::fritzbox::log_pcap_format_if_known(&decoder);
+        }
         match decoder.push(&chunk) {
             Ok(packets) if !packets.is_empty() => {
-                return if decoder.link_type() == Some(1) {
+                return if decoder.link_type()
+                    == Some(trapd_sensor_capture::fritzbox::LINKTYPE_ETHERNET)
+                {
                     Ok(())
                 } else {
                     Err("capture is not Ethernet PCAP".into())

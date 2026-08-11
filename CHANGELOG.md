@@ -62,6 +62,16 @@ All notable changes to TRAPD Sensor are documented here. The format follows
 
 ### Fixed
 
+- FRITZ!Box live capture and `setup --profile fritzbox` no longer reject
+  captures from FRITZ!OS versions/interfaces that emit the extended
+  (Alexey Kuznetsov-modified) classic-pcap format, magic `0xa1b2cd34`
+  (`34 cd b2 a1` little-endian) — previously reported as a generic
+  `invalid PCAP stream: unexpected magic bytes ...` even though it is a
+  real, if old, libpcap-compatible format. The decoder now models pcap
+  variant, endianness and timestamp precision explicitly and supports
+  standard, nanosecond, and extended pcap, both byte orders; see
+  `docs/fritzbox.md`.
+
 ### Added
 
 - Vendor-isolated FRITZ!OS authentication and live-capture primitives: legacy
