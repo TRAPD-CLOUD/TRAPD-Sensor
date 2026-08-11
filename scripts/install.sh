@@ -5,17 +5,19 @@
 #
 #   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash
 #
-# With an enrollment token supplied up front (kept out of shell history by
-# using an env var rather than a CLI flag):
-#
-#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh -o install.sh
-#   sudo TRAPD_ENROLL_TOKEN=enroll_xxxxxxxxxxxx bash install.sh
-#
 # Without a token, the script still installs everything and prompts for one
 # interactively (input hidden, read from the controlling terminal so it works
-# even when the script itself arrived via a pipe) — Ctrl-C at the prompt
-# skips enrollment and leaves the sensor installed-but-not-started, exactly
-# like the DEB/RPM packages do.
+# even when the script itself arrived via a pipe — this is the only form
+# that never puts the token in shell history) — Ctrl-C at the prompt skips
+# enrollment and leaves the sensor installed-but-not-started, exactly like
+# the DEB/RPM packages do.
+#
+# For non-interactive/automated enrollment, keep the token in a file and
+# read it from there — typing `TRAPD_ENROLL_TOKEN=enroll_xxx ...` at a live
+# prompt still records that whole line, env var or not:
+#
+#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh -o install.sh
+#   sudo TRAPD_ENROLL_TOKEN="$(cat /path/to/token-file)" bash install.sh
 #
 # What it does, in order: downloads the requested release (default: latest)
 # for the host's architecture, installs the two binaries plus the systemd

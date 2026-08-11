@@ -58,11 +58,17 @@ idempotent: re-running it upgrades the binaries and unit in place without
 touching an existing `config.toml` or the enrolled identity in
 `/var/lib/trapd-sensor`.
 
-To enroll non-interactively (keeps the token out of shell history):
+The interactive prompt above is the only form that never puts the token in
+shell history — typing `TRAPD_ENROLL_TOKEN=enroll_xxx ...` at a live prompt
+records that whole line regardless of the env-var indirection. For
+non-interactive/automated enrollment, keep the token in a file (e.g. written
+by your provisioning tool) and read it from there so only the file path, not
+the token, ends up in history:
 
 ```bash
 curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh -o install.sh
-sudo TRAPD_ENROLL_TOKEN=enroll_xxxxxxxxxxxx bash install.sh
+sudo TRAPD_ENROLL_TOKEN="$(cat /path/to/token-file)" bash install.sh
+shred -u /path/to/token-file   # or rm -f, if shred isn't available
 ```
 
 Run `install.sh --help` for `--version`, `--force-enroll`, and `--skip-enroll`.
