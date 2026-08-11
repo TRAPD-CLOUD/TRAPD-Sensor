@@ -55,6 +55,9 @@ struct Plan {
     gateway: Option<IpAddr>,
     lan: Option<String>,
     promiscuous: bool,
+    fritzbox_enabled: bool,
+    fritzbox_address: String,
+    fritzbox_interfaces: Vec<String>,
 }
 
 impl Plan {
@@ -67,6 +70,9 @@ impl Plan {
             gateway: config.deployment.gateway_ip,
             lan: config.deployment.lan_cidr.clone(),
             promiscuous: config.capture.promiscuous,
+            fritzbox_enabled: config.capture.fritzbox.enabled,
+            fritzbox_address: config.capture.fritzbox.address.clone(),
+            fritzbox_interfaces: config.capture.fritzbox.interfaces.clone(),
         }
     }
 
@@ -82,6 +88,9 @@ impl Plan {
         preview.deployment.lan_cidr = self.lan.clone();
         preview.capture.interfaces = self.interfaces.clone();
         preview.capture.promiscuous = self.promiscuous;
+        preview.capture.fritzbox.enabled = self.fritzbox_enabled;
+        preview.capture.fritzbox.address = self.fritzbox_address.clone();
+        preview.capture.fritzbox.interfaces = self.fritzbox_interfaces.clone();
         preview
     }
 }
@@ -189,6 +198,15 @@ pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> 
         }
     }
 
+    let mut new_credentials = None;
+    if plan.profile == NetworkProfile::Fritzbox {
+        if let Some(prompt) = prompt.as_mut() {
+            new_credentials = configure_fritzbox(prompt, &mut plan, config).await?;
+        }
+    } else {
+        plan.fritzbox_enabled = false;
+    }
+
     // --- Vantage point -------------------------------------------------------
     if let Some(prompt) = prompt.as_mut() {
         plan.vantage = match args.vantage {
@@ -260,12 +278,27 @@ pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> 
         }
     }
 
+    let credentials_changed = new_credentials.is_some();
+    if let Some(credentials) = &new_credentials {
+        let store = trapd_sensor_capture::fritzbox::SecretStore::new(
+            &config.capture.fritzbox.credentials_file,
+        );
+        store
+            .save(credentials)
+            .context("could not save FRITZ!Box credentials")?;
+        adopt_secret_ownership(store.path());
+    }
+
     let unchanged = plan == Plan::from_config(config);
     if unchanged && config.deployment.is_configured() {
         println!(
             "configuration already matches — {} unchanged",
             config_path.display()
         );
+        if credentials_changed {
+            println!("updated FRITZ!Box credentials");
+            println!("apply them with: systemctl restart trapd-sensor");
+        }
     } else {
         write_config(config_path, &plan)?;
         println!("wrote {}", config_path.display());
@@ -273,6 +306,173 @@ pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> 
     }
 
     Ok(())
+}
+
+async fn configure_fritzbox(
+    prompt: &mut Prompt,
+    plan: &mut Plan,
+    config: &SensorConfig,
+) -> anyhow::Result<Option<trapd_sensor_capture::fritzbox::Credentials>> {
+    prompt.say(&format!(
+        "\nFRITZ!Box live capture: {}\nAddress: {}\nInterfaces: {}\nCredentials: {}\n",
+        if plan.fritzbox_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        plan.fritzbox_address,
+        if plan.fritzbox_interfaces.is_empty() {
+            "(none)".into()
+        } else {
+            plan.fritzbox_interfaces.join(", ")
+        },
+        if config.capture.fritzbox.credentials_file.exists() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    ));
+    if !prompt.ask_yes_no("Enable FRITZ!Box live capture?", plan.fritzbox_enabled)? {
+        plan.fritzbox_enabled = false;
+        plan.fritzbox_interfaces.clear();
+        return Ok(None);
+    }
+    prompt.say(&format!(
+        "\nFRITZ!Box address [{}]: ",
+        plan.fritzbox_address
+    ));
+    let address = prompt.read_line()?;
+    if !address.is_empty() {
+        plan.fritzbox_address = address;
+    }
+    loop {
+        prompt.say("\nFRITZ!Box username: ");
+        let username = prompt.read_line()?;
+        let password = prompt.read_secret("FRITZ!Box password: ")?;
+        let credentials = trapd_sensor_capture::fritzbox::Credentials { username, password };
+        prompt.say("\nTesting authentication...\n");
+        let client = trapd_sensor_capture::fritzbox::FritzBoxClient::new(
+            &plan.fritzbox_address,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(15),
+        );
+        let result: Result<(), String> = match client {
+            Ok(client) => match client.authenticate(&credentials).await {
+                Ok(session) => match session.capture_interfaces().await {
+                    Ok(found) if !found.is_empty() => {
+                        prompt
+                            .say("✓ Authentication successful\n\nAvailable capture interfaces:\n");
+                        for (index, item) in found.iter().enumerate() {
+                            prompt.say(&format!(
+                                "  [{}] {}{}\n",
+                                index + 1,
+                                item.display_name,
+                                if item.available { "" } else { " (unavailable)" }
+                            ));
+                        }
+                        prompt.say("\nSelect one or more (comma separated): ");
+                        let selected = parse_selections(&prompt.read_line()?, found.len());
+                        if selected.is_empty() {
+                            Err("no interface selected".to_string())
+                        } else {
+                            let selected: Vec<_> = selected
+                                .into_iter()
+                                .filter_map(|n| found.get(n))
+                                .filter(|i| i.available)
+                                .cloned()
+                                .collect();
+                            if selected.is_empty() {
+                                Err("selected interfaces are unavailable".into())
+                            } else {
+                                prompt.say("Starting test capture...\n");
+                                if let Err(error) = validate_capture(
+                                    &session,
+                                    &selected[0],
+                                    config.capture.fritzbox.max_packet_bytes,
+                                )
+                                .await
+                                {
+                                    Err(error)
+                                } else {
+                                    plan.fritzbox_enabled = true;
+                                    plan.fritzbox_interfaces =
+                                        selected.into_iter().map(|i| i.id).collect();
+                                    prompt.say("✓ valid Ethernet PCAP and packets received\n");
+                                    return Ok(Some(credentials));
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => Err("router advertised no capture interfaces".into()),
+                    Err(_) => Err("interface discovery failed".into()),
+                },
+                Err(_) => Err("authentication failed".into()),
+            },
+            Err(_) => Err("invalid FRITZ!Box address".into()),
+        };
+        prompt.say(&format!("\n{result:?}\n"));
+        if !prompt.ask_yes_no(
+            "Retry FRITZ!Box setup? (No continues without live capture)",
+            true,
+        )? {
+            plan.fritzbox_enabled = false;
+            plan.fritzbox_interfaces.clear();
+            return Ok(None);
+        }
+    }
+}
+
+async fn validate_capture(
+    session: &trapd_sensor_capture::fritzbox::FritzBoxSession<'_>,
+    interface: &trapd_sensor_capture::fritzbox::CaptureInterface,
+    max_packet: usize,
+) -> Result<(), String> {
+    let mut response = session
+        .start_capture(interface, max_packet)
+        .await
+        .map_err(|_| "capture endpoint unavailable".to_string())?;
+    let mut decoder = trapd_sensor_capture::fritzbox::PcapStreamDecoder::new(max_packet);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let chunk = tokio::time::timeout_at(deadline, response.chunk())
+            .await
+            .map_err(|_| "capture test timed out".to_string())?
+            .map_err(|_| "capture stream failed".to_string())?
+            .ok_or_else(|| "capture stream closed".to_string())?;
+        if !decoder
+            .push(&chunk)
+            .map_err(|_| "invalid PCAP stream".to_string())?
+            .is_empty()
+        {
+            return if decoder.link_type() == Some(1) {
+                Ok(())
+            } else {
+                Err("capture is not Ethernet PCAP".into())
+            };
+        }
+    }
+    Err("no packet received during capture test".into())
+}
+
+fn parse_selections(text: &str, count: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        if let Ok(n) = part.trim().parse::<usize>() {
+            if (1..=count).contains(&n) && !out.contains(&(n - 1)) {
+                out.push(n - 1);
+            }
+        }
+    }
+    out
+}
+
+fn adopt_secret_ownership(path: &Path) {
+    if let (Some(uid), Some(gid)) = (sensor_user_id(), sensor_group_id()) {
+        adopt_ownership(path, path, uid, gid);
+        if let Some(parent) = path.parent() {
+            adopt_ownership(parent, parent, uid, gid);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +701,18 @@ fn update_document(document: &mut DocumentMut, plan: &Plan) -> anyhow::Result<()
     }
     capture["interfaces"] = value(interfaces);
     capture["promiscuous"] = value(plan.promiscuous);
+    let fritzbox = capture
+        .entry("fritzbox")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[capture.fritzbox] is not a table")?;
+    fritzbox["enabled"] = value(plan.fritzbox_enabled);
+    fritzbox["address"] = value(plan.fritzbox_address.as_str());
+    let mut remote_interfaces = Array::new();
+    for id in &plan.fritzbox_interfaces {
+        remote_interfaces.push(id.as_str());
+    }
+    fritzbox["interfaces"] = value(remote_interfaces);
     Ok(())
 }
 
@@ -642,6 +854,20 @@ fn sensor_group_id() -> Option<u32> {
         .find_map(|line| parse_group_line(line, "trapd-sensor"))
 }
 
+fn sensor_user_id() -> Option<u32> {
+    std::fs::read_to_string("/etc/passwd")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            if fields.next()? != "trapd-sensor" {
+                return None;
+            }
+            fields.next()?;
+            fields.next()?.parse().ok()
+        })
+}
+
 fn parse_group_line(line: &str, name: &str) -> Option<u32> {
     let mut fields = line.split(':');
     if fields.next()? != name {
@@ -687,6 +913,28 @@ impl Prompt {
             bail!("the terminal closed while setup was waiting for an answer");
         }
         Ok(line.trim().to_string())
+    }
+
+    fn read_secret(&mut self, question: &str) -> anyhow::Result<String> {
+        use std::os::fd::AsRawFd;
+        self.say(question);
+        let fd = self.input.get_ref().as_raw_fd();
+        let mut old = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut hidden = old;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let result = self.read_line();
+        let restored = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
+        self.say("\n");
+        if restored != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        result
     }
 
     fn ask_yes_no(&mut self, question: &str, default: bool) -> anyhow::Result<bool> {
@@ -750,6 +998,9 @@ mod tests {
             gateway: Some("192.168.178.1".parse().expect("ip")),
             lan: Some("192.168.178.0/24".into()),
             promiscuous: true,
+            fritzbox_enabled: false,
+            fritzbox_address: "fritz.box".into(),
+            fritzbox_interfaces: Vec::new(),
         }
     }
 

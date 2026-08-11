@@ -12,6 +12,27 @@ use trapd_sensor_transport::UploaderStats;
 
 use crate::admin::Uptime;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FritzBoxHealth {
+    pub enabled: bool,
+    pub state: String,
+    pub address: String,
+    pub configured_interfaces: Vec<String>,
+    pub active_interfaces: Vec<String>,
+    pub authenticated: bool,
+    pub last_successful_auth: Option<String>,
+    pub last_packet_at: Option<String>,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub reconnect_count: u64,
+    pub auth_failure_count: u64,
+    pub stream_error_count: u64,
+    pub parser_error_count: u64,
+    pub deduplicated_packets: u64,
+    pub current_backoff_secs: u64,
+    pub last_error_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthState {
     Healthy,
@@ -46,6 +67,7 @@ pub struct SensorState {
     /// Der Zustand hält sie als fertiges JSON, damit der Admin-Endpunkt beim
     /// Abruf nichts herleiten muss.
     deployment: Mutex<Option<serde_json::Value>>,
+    fritzbox: Mutex<Option<FritzBoxHealth>>,
     interfaces_up: AtomicU64,
     interfaces_configured: AtomicU64,
     packets_captured: AtomicU64,
@@ -78,6 +100,7 @@ impl SensorState {
             uploader: Arc::new(UploaderStats::default()),
             mode: Mutex::new(mode),
             deployment: Mutex::new(None),
+            fritzbox: Mutex::new(None),
             interfaces_up: AtomicU64::new(0),
             interfaces_configured: AtomicU64::new(0),
             packets_captured: AtomicU64::new(0),
@@ -115,8 +138,75 @@ impl SensorState {
         }
     }
 
+    pub fn init_fritzbox(&self, address: String, interfaces: Vec<String>) {
+        if let Ok(mut slot) = self.fritzbox.lock() {
+            *slot = Some(FritzBoxHealth {
+                enabled: true,
+                state: "starting".into(),
+                address,
+                configured_interfaces: interfaces,
+                active_interfaces: Vec::new(),
+                authenticated: false,
+                last_successful_auth: None,
+                last_packet_at: None,
+                packets_received: 0,
+                bytes_received: 0,
+                reconnect_count: 0,
+                auth_failure_count: 0,
+                stream_error_count: 0,
+                parser_error_count: 0,
+                deduplicated_packets: 0,
+                current_backoff_secs: 0,
+                last_error_code: None,
+            });
+        }
+    }
+
+    pub fn update_fritzbox(&self, update: impl FnOnce(&mut FritzBoxHealth)) {
+        if let Ok(mut health) = self.fritzbox.lock() {
+            if let Some(health) = health.as_mut() {
+                update(health);
+            }
+        }
+    }
+    pub fn fritzbox_interface_up(&self, interface: &str) {
+        self.update_fritzbox(|h| {
+            if !h.active_interfaces.iter().any(|id| id == interface) {
+                h.active_interfaces.push(interface.into());
+            }
+            h.state = "capturing".into();
+            h.authenticated = true;
+            h.current_backoff_secs = 0;
+        });
+        self.interface_became_up();
+    }
+    pub fn fritzbox_interface_down(&self, interface: &str) {
+        let mut removed = false;
+        self.update_fritzbox(|h| {
+            let before = h.active_interfaces.len();
+            h.active_interfaces.retain(|id| id != interface);
+            removed = before != h.active_interfaces.len();
+            if h.active_interfaces.is_empty() {
+                h.authenticated = false;
+            }
+        });
+        if removed {
+            self.interface_became_down();
+        }
+    }
+
     pub fn set_interfaces_up(&self, count: u64) {
         self.interfaces_up.store(count, Ordering::Relaxed);
+    }
+    pub fn interface_became_up(&self) {
+        self.interfaces_up.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn interface_became_down(&self) {
+        self.interfaces_up
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn set_interfaces_configured(&self, count: u64) {
@@ -439,6 +529,16 @@ impl SensorState {
             self.sweeps_completed.load(Ordering::Relaxed),
         );
 
+        if let Ok(health) = self.fritzbox.lock() {
+            if let Some(health) = health.as_ref() {
+                out.push_str(&format!("# TYPE trapd_sensor_capture_up gauge\ntrapd_sensor_capture_up{{provider=\"fritzbox\"}} {}\n", u64::from(health.state=="capturing")));
+                out.push_str(&format!("# TYPE trapd_sensor_capture_packets_total counter\ntrapd_sensor_capture_packets_total{{provider=\"fritzbox\"}} {}\n",health.packets_received));
+                out.push_str(&format!("# TYPE trapd_sensor_capture_bytes_total counter\ntrapd_sensor_capture_bytes_total{{provider=\"fritzbox\"}} {}\n",health.bytes_received));
+                out.push_str(&format!("# TYPE trapd_sensor_capture_reconnects_total counter\ntrapd_sensor_capture_reconnects_total{{provider=\"fritzbox\"}} {}\n",health.reconnect_count));
+                out.push_str(&format!("# TYPE trapd_sensor_capture_errors_total counter\ntrapd_sensor_capture_errors_total{{provider=\"fritzbox\",reason=\"auth\"}} {}\ntrapd_sensor_capture_errors_total{{provider=\"fritzbox\",reason=\"stream\"}} {}\ntrapd_sensor_capture_errors_total{{provider=\"fritzbox\",reason=\"parser\"}} {}\n",health.auth_failure_count,health.stream_error_count,health.parser_error_count));
+            }
+        }
+
         out
     }
 
@@ -482,6 +582,9 @@ impl SensorState {
                 .lock()
                 .ok()
                 .and_then(|d| d.clone()),
+            "capture_providers": {
+                "fritzbox": self.fritzbox.lock().ok().and_then(|h| h.clone()),
+            },
             "active_discovery_disabled_reason": self
                 .active_disabled_reason
                 .lock()

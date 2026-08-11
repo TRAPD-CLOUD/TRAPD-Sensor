@@ -32,6 +32,7 @@ pub enum ProviderState {
     Authenticating,
     DiscoveringInterfaces,
     Connecting,
+    ValidatingStream,
     Capturing,
     Degraded,
     Reconnecting,

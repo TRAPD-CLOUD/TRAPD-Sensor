@@ -8,6 +8,11 @@ All notable changes to TRAPD Sensor are documented here. The format follows
 
 ### Added
 
+- End-to-end supervised FRITZ!Box capture in the daemon, including fresh-session
+  reconnects, interface validation, Ethernet PCAP ingestion through the existing
+  passive observer, bounded backpressure, status/metrics/diagnose/check output,
+  and hidden-password interactive setup.
+
 - **Installation editions.** `install.sh --edition homelab|enterprise` (also
   `TRAPD_EDITION`) selects how the network setup is answered — guided for
   homelab, flag-driven for enterprise — using one installer and one setup

@@ -33,12 +33,41 @@ Internet.
 The capture CGI and page markup are undocumented FRITZ!OS internals and may
 change. Empty discovery results are a compatibility failure, not evidence that
 particular interfaces exist. Interface IDs are opaque and model-specific.
-Multiple IDs are represented in configuration for future concurrent capture;
-overlapping sources can duplicate observations, so production concurrency must
-add a bounded deduplication window before it is enabled.
+Multiple configured IDs run as independent workers. Some firmware may reject
+simultaneous captures; that source is then reported degraded rather than being
+silently discarded or taking down the other workers. The fixture set provides
+no evidence that advertised sources overlap, so runtime does not currently
+deduplicate them. Operators should avoid overlapping selections; a future
+bounded, short-window deduplicator can be added without changing packet parsing.
 
-This release provides the hardened provider primitives and schema. Daemon
-supervision, interactive credential prompting, provider status/metrics, and
-automatic frame injection are intentionally not enabled until router fixture
-testing validates current FRITZ!OS endpoint variants. Merely enabling the schema
-does not yet start a daemon capture task.
+## Setup and operation
+
+Run `trapd-sensorctl setup --profile fritzbox`, enable live capture, and enter a
+FRITZ!Box account. Password input is read from `/dev/tty` with echo disabled.
+Use a dedicated least-privilege router user where the installed FRITZ!OS version
+offers capture-only rights. Setup authenticates, displays only sources returned
+by that router, and requires a valid Ethernet PCAP packet before saving.
+
+The daemon starts one independently supervised worker per configured source.
+Every reconnect obtains a fresh SID and rediscovers the source; EOF, router
+reboot, malformed PCAP, session failure, and DNS/network errors degrade only the
+remote provider and trigger bounded backoff. Decoded Ethernet frames go directly
+through the existing `PassiveObserver` and bounded observation channel. Raw
+frames are dropped after analysis and never enter the WAL.
+
+`trapd-sensorctl status` reports provider state, selected opaque IDs, packet
+counts, sanitized failure code, and retry delay. `diagnose` checks the protected
+credential file, authentication, discovery, and configured source availability;
+`trapd-sensord --check` performs static address, secret, timeout, and limit
+validation without requiring the router online.
+
+Re-run setup to change credentials, address, or sources, or answer “no” to
+disable the provider. The service must be restarted after configuration changes.
+Source names and IDs have no standardized visibility semantics, so TRAPD does
+not infer full LAN or east-west visibility merely from their labels.
+
+Runtime behavior is covered by a deterministic local FRITZ!Box HTTP fixture,
+including login, discovery, one-byte-fragmented PCAP streaming, Ethernet link
+validation, and delivery into the ordinary passive pipeline. No claim is made
+for a particular physical model or firmware release; the undocumented endpoints
+may still require compatibility updates.

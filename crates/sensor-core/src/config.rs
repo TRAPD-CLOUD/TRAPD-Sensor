@@ -478,6 +478,26 @@ impl SensorConfig {
         if self.capture.snaplen < 64 {
             return Err(SensorError::Config("capture.snaplen must be >= 64".into()));
         }
+        if self.capture.fritzbox.enabled {
+            if self.capture.fritzbox.interfaces.is_empty() {
+                return Err(SensorError::Config(
+                    "capture.fritzbox.interfaces must not be empty when enabled".into(),
+                ));
+            }
+            if self.capture.fritzbox.address.trim().is_empty()
+                || self.capture.fritzbox.connect_timeout_secs == 0
+                || self.capture.fritzbox.read_timeout_secs == 0
+            {
+                return Err(SensorError::Config(
+                    "FRITZ!Box address and timeouts must be non-empty/non-zero".into(),
+                ));
+            }
+            if !(64..=1_048_576).contains(&self.capture.fritzbox.max_packet_bytes) {
+                return Err(SensorError::Config(
+                    "capture.fritzbox.max_packet_bytes must be between 64 and 1048576".into(),
+                ));
+            }
+        }
         if self.active.enabled && self.active.rate_limit_per_sec == 0 {
             return Err(SensorError::Config(
                 "active.rate_limit_per_sec must be > 0 when active discovery is enabled".into(),
