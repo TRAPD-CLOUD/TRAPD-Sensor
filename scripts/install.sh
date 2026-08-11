@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# TRAPD Network Sensor — one-line installer for systemd-based Linux.
+#
+# Recommended usage (see README.md):
+#
+#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash
+#
+# With an enrollment token supplied up front (kept out of shell history by
+# using an env var rather than a CLI flag):
+#
+#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh -o install.sh
+#   sudo TRAPD_ENROLL_TOKEN=enroll_xxxxxxxxxxxx bash install.sh
+#
+# Without a token, the script still installs everything and prompts for one
+# interactively (input hidden, read from the controlling terminal so it works
+# even when the script itself arrived via a pipe) — Ctrl-C at the prompt
+# skips enrollment and leaves the sensor installed-but-not-started, exactly
+# like the DEB/RPM packages do.
+#
+# What it does, in order: downloads the requested release (default: latest)
+# for the host's architecture, installs the two binaries plus the systemd
+# unit/sysusers/tmpfiles definitions, creates the trapd-sensor system user
+# and state/config directories, grants CAP_NET_RAW/CAP_NET_ADMIN, enrolls
+# with the token, starts the service, then runs `status` and `diagnose` so
+# the operator sees a live sensor (or a clear reason why not) before the
+# script exits.
+#
+# Idempotent: safe to re-run for upgrades. Never overwrites an existing
+# config.toml, never touches /var/lib/trapd-sensor (enrollment identity +
+# offline queue survive upgrades), and skips enrollment if the sensor is
+# already enrolled unless --force is given.
+
+set -Eeuo pipefail
+
+REPO="TRAPD-CLOUD/TRAPD-Sensor"
+VERSION="${TRAPD_SENSOR_VERSION:-latest}"
+TOKEN="${TRAPD_ENROLL_TOKEN:-}"
+FORCE_ENROLL=0
+SKIP_ENROLL=0
+BIN_DIR="/usr/bin"
+CONFIG_DIR="/etc/trapd-sensor"
+STATE_DIR="/var/lib/trapd-sensor"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+SYSUSERS_DIR="/usr/lib/sysusers.d"
+TMPFILES_DIR="/usr/lib/tmpfiles.d"
+WORKDIR=""
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m warning:\033[0m %s\n' "$*" >&2; }
+# die() is for expected, already-explained failures (bad args, missing
+# prerequisites, a rejected token) — the message alone is the whole story,
+# so it disables the ERR trap first to avoid a second, generic "something
+# failed" line underneath a specific one.
+die()  { trap - ERR; printf '\033[1;31m error:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Catches everything unexpected: a command failing for a reason this script
+# didn't anticipate. Re-running is safe (see the idempotency notes above).
+on_err() {
+  local line=$1
+  printf '\033[1;31m error:\033[0m installation failed unexpectedly at line %s — nothing after that point ran. Re-running this script is safe (it'"'"'s idempotent) once the cause above is fixed.\n' "$line" >&2
+  exit 1
+}
+trap 'on_err $LINENO' ERR
+
+cleanup() {
+  [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [options]
+
+Options:
+  --token <TOKEN>     Enrollment token (prefer TRAPD_ENROLL_TOKEN env var
+                       instead, so the token never lands in shell history).
+  --version <TAG>     Install a specific release tag instead of latest,
+                       e.g. --version v0.1.0. Default: latest.
+  --force-enroll      Re-enroll even if this host already has an identity
+                       (replaces /var/lib/trapd-sensor/identity.json).
+  --skip-enroll       Install everything but do not enroll or start the
+                       service, even if a token is available.
+  -h, --help          Show this help.
+
+Environment variables:
+  TRAPD_ENROLL_TOKEN   Same as --token.
+  TRAPD_SENSOR_VERSION Same as --version.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --token) TOKEN="${2:?--token requires a value}"; shift 2 ;;
+    --version) VERSION="${2:?--version requires a value}"; shift 2 ;;
+    --force-enroll) FORCE_ENROLL=1; shift ;;
+    --skip-enroll) SKIP_ENROLL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+# --- Preflight ---------------------------------------------------------
+
+[[ "$(uname -s)" == "Linux" ]] || die "TRAPD Sensor only supports Linux."
+command -v systemctl >/dev/null 2>&1 || die "systemd (systemctl) not found — this installer targets systemd-based distributions only."
+[[ -d /run/systemd/system ]] || die "systemctl is present but systemd is not running as PID 1 (common in plain containers/chroots) — this installer needs a real systemd instance to create the service user (systemd-sysusers) and manage the unit. Install manually instead; see docs/deployment.md."
+command -v curl >/dev/null 2>&1 || die "curl is required. Install it (e.g. 'apt install curl' or 'dnf install curl') and re-run."
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  die "this installer needs root (it creates a system user and installs to /usr/bin, /etc, /var/lib). Re-run with sudo."
+fi
+
+case "$(uname -m)" in
+  x86_64|amd64) TARGET="x86_64-unknown-linux-gnu" ;;
+  aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+  *) die "unsupported architecture: $(uname -m) — TRAPD Sensor releases cover amd64 and arm64 only." ;;
+esac
+log "detected architecture: $(uname -m) -> $TARGET"
+
+# --- Resolve download base URL -----------------------------------------
+
+if [[ "$VERSION" == "latest" ]]; then
+  RELEASE_PATH="latest/download"
+  log "installing the latest release"
+else
+  RELEASE_PATH="download/${VERSION}"
+  log "installing release ${VERSION}"
+fi
+# Overridable for testing or an internal mirror/air-gapped staging server;
+# not a supported public flag, deliberately undocumented in --help.
+BASE_URL="${TRAPD_INSTALL_BASE_URL:-https://github.com/${REPO}/releases/${RELEASE_PATH}}"
+
+WORKDIR="$(mktemp -d)"
+
+fetch() {
+  local name="$1" dest="$2"
+  curl -fsSL --retry 3 --retry-connrefused -o "$dest" "${BASE_URL}/${name}" \
+    || die "could not download ${name} from ${BASE_URL} — check the version/network, or see README.md for a from-source install."
+}
+
+log "downloading trapd-sensord and trapd-sensorctl (${TARGET})"
+fetch "trapd-sensord-${TARGET}" "$WORKDIR/trapd-sensord"
+fetch "trapd-sensorctl-${TARGET}" "$WORKDIR/trapd-sensorctl"
+fetch "SHA256SUMS" "$WORKDIR/SHA256SUMS"
+
+log "verifying checksums"
+(
+  cd "$WORKDIR"
+  awk -v a="trapd-sensord-${TARGET}" -v b="trapd-sensorctl-${TARGET}" \
+    '$2==a || $2==b {print}' SHA256SUMS > expected.sums
+  [[ -s expected.sums ]] || exit 2
+  sed -e "s/trapd-sensord-${TARGET}/trapd-sensord/" -e "s/trapd-sensorctl-${TARGET}/trapd-sensorctl/" expected.sums > renamed.sums
+  sha256sum --check --strict renamed.sums >&2
+) || {
+  status=$?
+  if [[ $status -eq 2 ]]; then
+    die "SHA256SUMS did not list the downloaded binaries — refusing to install unverified files."
+  else
+    die "checksum verification failed — downloaded files do not match SHA256SUMS. Not installing."
+  fi
+}
+chmod 0755 "$WORKDIR/trapd-sensord" "$WORKDIR/trapd-sensorctl"
+
+log "downloading packaging files (systemd unit, sysusers, tmpfiles, example config)"
+fetch "packaging.tar.gz" "$WORKDIR/packaging.tar.gz"
+tar -xzf "$WORKDIR/packaging.tar.gz" -C "$WORKDIR"
+[[ -f "$WORKDIR/packaging/systemd/trapd-sensor.service" ]] \
+  || die "packaging.tar.gz did not contain the expected files — release asset looks corrupt."
+
+# --- Install (idempotent: upgrades binaries/unit, never touches state) --
+
+RESTART_AFTER=0
+if systemctl is-active --quiet trapd-sensor 2>/dev/null; then
+  RESTART_AFTER=1
+fi
+
+log "installing trapd-sensord and trapd-sensorctl to ${BIN_DIR}"
+install -m 0755 "$WORKDIR/trapd-sensord" "${BIN_DIR}/trapd-sensord"
+install -m 0755 "$WORKDIR/trapd-sensorctl" "${BIN_DIR}/trapd-sensorctl"
+
+log "installing systemd unit, sysusers.d and tmpfiles.d definitions"
+install -m 0644 "$WORKDIR/packaging/systemd/trapd-sensor.service" "${SYSTEMD_UNIT_DIR}/trapd-sensor.service"
+install -Dm 0644 "$WORKDIR/packaging/systemd/trapd-sensor.sysusers" "${SYSUSERS_DIR}/trapd-sensor.conf"
+install -Dm 0644 "$WORKDIR/packaging/systemd/trapd-sensor.tmpfiles" "${TMPFILES_DIR}/trapd-sensor.conf"
+
+log "creating the trapd-sensor system user and state directories"
+systemd-sysusers "${SYSUSERS_DIR}/trapd-sensor.conf"
+systemd-tmpfiles --create "${TMPFILES_DIR}/trapd-sensor.conf"
+systemctl daemon-reload
+
+log "granting CAP_NET_RAW/CAP_NET_ADMIN on the daemon binary"
+if command -v setcap >/dev/null 2>&1; then
+  setcap cap_net_raw,cap_net_admin+eip "${BIN_DIR}/trapd-sensord" \
+    || warn "setcap failed — the packaged systemd unit's AmbientCapabilities= still grants these at service start, so this is not fatal, but running the binary outside systemd will need it. Install 'libcap2-bin' (Debian/Ubuntu) or 'libcap' (RHEL/Fedora) and re-run to fix."
+else
+  warn "setcap not found — relying on the systemd unit's AmbientCapabilities= (fine for 'systemctl start trapd-sensor', not for running the binary directly). Install 'libcap2-bin' (Debian/Ubuntu) or 'libcap' (RHEL/Fedora) if you need the latter."
+fi
+
+if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
+  log "installing default config to ${CONFIG_DIR}/config.toml (edit before enrolling in sensitive networks)"
+  install -m 0640 -g trapd-sensor "$WORKDIR/packaging/config.example.toml" "${CONFIG_DIR}/config.toml"
+else
+  log "existing ${CONFIG_DIR}/config.toml left untouched"
+fi
+install -m 0644 -o root -g root "$WORKDIR/packaging/config.example.toml" "${CONFIG_DIR}/config.toml.example"
+
+# --- Enroll --------------------------------------------------------------
+
+ALREADY_ENROLLED=0
+[[ -f "${STATE_DIR}/identity.json" ]] && ALREADY_ENROLLED=1
+
+if [[ "$SKIP_ENROLL" -eq 1 ]]; then
+  log "skipping enrollment (--skip-enroll)"
+elif [[ "$ALREADY_ENROLLED" -eq 1 && "$FORCE_ENROLL" -eq 0 ]]; then
+  log "sensor is already enrolled (${STATE_DIR}/identity.json exists) — leaving identity as-is. Pass --force-enroll to replace it."
+else
+  if [[ -z "$TOKEN" ]]; then
+    # -r only checks the permission bit; the open itself can still fail
+    # (no controlling terminal — piped-and-backgrounded, CI, containers
+    # without a tty). Both the prompt and the read must be probed as an
+    # `if` condition, not run bare, or that failure would trip `set -e`.
+    if exec 3<>/dev/tty 2>/dev/null; then
+      printf 'Enrollment token (from the TRAPD dashboard, input hidden — leave empty to skip): ' >&3
+      IFS= read -rs TOKEN <&3 || true
+      printf '\n' >&3
+      exec 3>&-
+    else
+      warn "no enrollment token and no terminal to prompt on — skipping enrollment. Run 'trapd-sensorctl enroll --token <TOKEN>' as the trapd-sensor user once you have one."
+    fi
+  fi
+
+  if [[ -n "$TOKEN" ]]; then
+    log "enrolling with the TRAPD backend"
+    ENROLL_ARGS=(enroll --token "$TOKEN")
+    [[ "$FORCE_ENROLL" -eq 1 ]] && ENROLL_ARGS+=(--force)
+    if ! sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
+      die "enrollment failed (see the error above — usually an expired/invalid token or an unreachable backend.api_url in ${CONFIG_DIR}/config.toml). Everything else is installed; fix the cause and re-run: sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+    fi
+  fi
+fi
+unset TOKEN
+
+# --- Start + verify -------------------------------------------------------
+
+if [[ -f "${STATE_DIR}/identity.json" ]]; then
+  if [[ "$RESTART_AFTER" -eq 1 ]]; then
+    log "restarting trapd-sensor (was already running — upgrading in place)"
+    systemctl restart trapd-sensor
+  else
+    log "starting trapd-sensor"
+    systemctl enable --now trapd-sensor
+  fi
+  sleep 1
+  echo
+  sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" status || warn "status check failed — the service may still be starting; try 'trapd-sensorctl status' again in a few seconds."
+else
+  log "not starting the service — the sensor is installed but not enrolled yet."
+  echo "Enroll and start it with:"
+  echo "  sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+  echo "  sudo systemctl enable --now trapd-sensor"
+fi
+
+echo
+log "running diagnostics"
+sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" diagnose || true
+
+echo
+log "done. 'systemctl status trapd-sensor' and 'journalctl -u trapd-sensor -f' for logs."
