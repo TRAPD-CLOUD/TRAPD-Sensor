@@ -110,6 +110,9 @@ fn report_configuration(config: &SensorConfig) {
     let interfaces = trapd_sensor_capture::select_interfaces(&config.capture.interfaces);
 
     println!("configuration is valid\n");
+    println!("  edition:           {}", config.deployment.edition);
+    println!("  network:           {}", config.deployment.profile.label());
+    println!("  vantage:           {}", config.deployment.vantage.label());
     println!("  mode:              {}", config.sensor.mode.as_str());
     println!("  state directory:   {}", config.sensor.state_dir.display());
     println!("  queue directory:   {}", config.buffer.dir.display());
@@ -183,6 +186,20 @@ fn report_configuration(config: &SensorConfig) {
                 println!("    reason:          {reason}");
             }
         }
+    }
+
+    // Was der Sensor an diesem Anschluss überhaupt sehen kann. Steht bewusst
+    // neben der Policy: die eine Hälfte ist "was er darf", die andere "was
+    // ankommt".
+    let visibility = config.visibility();
+    println!("\n  visibility:");
+    for capability in &visibility.capabilities {
+        println!(
+            "    {} {:<30} {}",
+            capability.level.symbol(),
+            capability.label,
+            capability.reason
+        );
     }
 
     println!("\n  privacy:");

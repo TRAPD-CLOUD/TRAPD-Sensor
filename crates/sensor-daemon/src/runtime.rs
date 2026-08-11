@@ -79,6 +79,20 @@ impl Daemon {
             tracing::info!(reason, "active discovery is not running");
         }
 
+        // Wo der Sensor hängt und was er dort sehen kann — einmal beim Start
+        // berechnet, danach über `/admin/status` abrufbar. Im Log steht es,
+        // weil "der Sensor meldet keine DNS-Abfragen" sonst als Fehlersuche
+        // beginnt statt als Blick in die Auskunft.
+        let visibility = self.config.visibility();
+        tracing::info!(
+            edition = visibility.edition.as_str(),
+            profile = visibility.profile.as_str(),
+            vantage = visibility.vantage.as_str(),
+            configured = visibility.configured,
+            "network vantage point"
+        );
+        self.state.set_deployment(deployment_status(&visibility));
+
         // --- Queue und Uploader ---
         let queue = EventQueue::open(
             &self.config.buffer.dir,
@@ -298,6 +312,39 @@ impl Daemon {
         );
         failure.map_or(Ok(()), |error| Err(anyhow::anyhow!(error)))
     }
+}
+
+/// Die Deployment-/Sichtbarkeitsauskunft für `/admin/status`.
+///
+/// Bewusst dieselbe Herleitung wie `trapd-sensorctl visibility`: die eine
+/// Quelle ist [`VisibilityReport`](trapd_sensor_core::visibility::VisibilityReport),
+/// hier nur anders verpackt — Dashboard und CLI dürfen sich nicht
+/// widersprechen.
+fn deployment_status(
+    report: &trapd_sensor_core::visibility::VisibilityReport,
+) -> serde_json::Value {
+    let capabilities: serde_json::Map<String, serde_json::Value> = report
+        .capabilities
+        .iter()
+        .map(|capability| {
+            (
+                capability.id.to_string(),
+                serde_json::json!({
+                    "level": capability.level.as_str(),
+                    "reason": capability.reason,
+                }),
+            )
+        })
+        .collect();
+
+    serde_json::json!({
+        "edition": report.edition.as_str(),
+        "profile": report.profile.as_str(),
+        "vantage": report.vantage.as_str(),
+        "configured": report.configured,
+        "visibility": capabilities,
+        "notes": report.notes,
+    })
 }
 
 fn join_description(result: Result<(), tokio::task::JoinError>) -> String {

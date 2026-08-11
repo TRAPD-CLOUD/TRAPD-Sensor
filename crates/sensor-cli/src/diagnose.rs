@@ -84,6 +84,7 @@ pub fn config_failure(path: &Path) -> Report {
 pub async fn run(config_path: &Path, config: &SensorConfig) -> Report {
     let mut report = Report::new();
     check_config(&mut report, config_path, config);
+    check_deployment(&mut report, config);
     check_service(&mut report, config);
     check_capabilities(&mut report, config);
     check_network(&mut report, config);
@@ -135,6 +136,62 @@ fn check_config(report: &mut Report, path: &Path, config: &SensorConfig) {
             config.active.acknowledged,
             policy.active.is_some()
         ),
+    );
+}
+
+/// Wie der Sensor am Netz hängt — und ob die Konfiguration dazu passt.
+///
+/// Der teuerste Fehler in diesem Bereich ist stumm: ein Sensor an einem
+/// Mirror-Port mit abgeschaltetem Promiscuous-Modus läuft fehlerfrei und
+/// meldet fast nichts. Das gehört in die Diagnose, nicht in die Fehlersuche
+/// nach drei Wochen.
+fn check_deployment(report: &mut Report, config: &SensorConfig) {
+    let deployment = &config.deployment;
+    let visibility = config.visibility();
+
+    report.push(
+        "deployment.profile",
+        if deployment.is_configured() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        if deployment.is_configured() {
+            format!(
+                "edition={}, profile={}, vantage={}",
+                deployment.edition, deployment.profile, deployment.vantage
+            )
+        } else {
+            "the network environment was never recorded — run 'trapd-sensorctl setup' so the \
+             visibility report reflects reality"
+                .to_string()
+        },
+    );
+
+    if deployment.vantage.requires_promiscuous() && !config.capture.promiscuous {
+        report.push(
+            "deployment.promiscuous",
+            CheckStatus::Error,
+            format!(
+                "vantage {} needs promiscuous mode, but capture.promiscuous is false — the \
+                 sensor only sees traffic addressed to this host",
+                deployment.vantage
+            ),
+        );
+    }
+
+    // Die Sichtbarkeit selbst ist kein Fehler, nur eine Auskunft: ein Homelab
+    // ohne SPAN ist korrekt eingerichtet, es sieht eben weniger. Eine Zeile,
+    // maschinenlesbar; die Begründungen stehen in `trapd-sensorctl visibility`.
+    report.push(
+        "deployment.visibility",
+        CheckStatus::Ok,
+        visibility
+            .capabilities
+            .iter()
+            .map(|c| format!("{}={}", c.id, c.level.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
     );
 }
 
@@ -603,6 +660,59 @@ mod tests {
     #[test]
     fn getcap_output_without_an_equals_sign_means_no_capabilities() {
         assert!(parse_getcap_output("/usr/bin/trapd-sensord\n").is_none());
+    }
+
+    #[test]
+    fn an_unconfigured_deployment_is_a_warning_not_a_failure() {
+        let mut report = Report::new();
+        check_deployment(&mut report, &SensorConfig::default());
+
+        let profile = report
+            .checks
+            .iter()
+            .find(|c| c.id == "deployment.profile")
+            .expect("profile check");
+        assert_eq!(profile.status, CheckStatus::Warning);
+        assert!(profile.message.contains("trapd-sensorctl setup"));
+        assert_eq!(report.exit_code(), 1, "a fresh sensor must not look broken");
+    }
+
+    /// Der stumme Fehler: Mirror-Port ohne Promiscuous. Läuft fehlerfrei,
+    /// sieht nichts.
+    #[test]
+    fn a_mirror_port_without_promiscuous_is_an_error() {
+        let mut config = SensorConfig::default();
+        config.deployment.profile = trapd_sensor_core::deployment::NetworkProfile::Span;
+        config.deployment.vantage = trapd_sensor_core::deployment::Vantage::MirrorPort;
+        config.capture.promiscuous = false;
+
+        let mut report = Report::new();
+        check_deployment(&mut report, &config);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "deployment.promiscuous")
+            .expect("promiscuous check");
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(check.message.contains("capture.promiscuous"));
+    }
+
+    #[test]
+    fn the_visibility_line_is_machine_readable() {
+        let mut config = SensorConfig::default();
+        config.deployment.profile = trapd_sensor_core::deployment::NetworkProfile::Fritzbox;
+
+        let mut report = Report::new();
+        check_deployment(&mut report, &config);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "deployment.visibility")
+            .expect("visibility check");
+        assert!(check.message.contains("asset_discovery=full"));
+        assert!(check.message.contains("full_packet_visibility=none"));
     }
 
     #[test]

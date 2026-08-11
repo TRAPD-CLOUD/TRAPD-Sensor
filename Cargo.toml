@@ -46,6 +46,11 @@ tokio = { version = "1", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Formaterhaltendes TOML-Schreiben fuer `trapd-sensorctl setup`: die
+# ausgelieferte config.toml besteht groesstenteils aus Kommentaren, die das
+# Sicherheitsmodell erklaeren — ein Rueckschreiben ueber serde wuerde sie
+# loeschen. Steht ohnehin schon als Abhaengigkeit von `toml` im Baum.
+toml_edit = "0.22"
 # Fehlerbehandlung: anyhow an den Applikationsrändern, thiserror in den Libs.
 anyhow = "1"
 thiserror = "2"

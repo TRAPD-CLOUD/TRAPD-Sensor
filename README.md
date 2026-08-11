@@ -43,11 +43,66 @@ wie man hineinkommt.
 Supported production platforms are current systemd-based Debian/Ubuntu and
 RHEL/Fedora/Rocky Linux on AMD64 or ARM64.
 
+Two editions, one installer and one code path — they differ only in how the
+network setup is answered:
+
 ### Homelab quickstart
 
 ```bash
-curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash -s -- --edition homelab
 ```
+
+After installing, a guided setup detects interface, gateway and local network
+and asks how the network is managed:
+
+```
+TRAPD Network Sensor
+Homelab Setup
+
+Network environment detected.
+
+  interface: eth0
+  gateway:   192.168.178.1
+  network:   192.168.178.0/24
+
+How is your network managed?
+
+  [1] FRITZ!Box
+  [2] UniFi
+  [3] OPNsense
+  [4] pfSense
+  [5] OpenWrt
+  [6] Managed Switch / SPAN
+  [7] Other / Generic Router  (default)
+  [8] Manual Setup
+```
+
+**No managed switch and no mirror port is required.** A plain
+`Internet — FRITZ!Box — LAN` network is a supported deployment: ARP/NDP, DHCP,
+mDNS and SSDP are broadcast/multicast and reach every switch port, so asset
+discovery, new-device detection and fingerprinting work there in full. What
+such a network cannot give — other hosts' DNS and traffic — is reported as
+missing rather than implied; see [Visibility](#visibility).
+
+### Enterprise quickstart
+
+```bash
+curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash -s -- --edition enterprise
+```
+
+The same setup, driven by flags, so it finishes without a terminal:
+
+```bash
+sudo TRAPD_ENROLL_TOKEN="$(cat /path/to/token-file)" bash install.sh \
+  --edition enterprise --non-interactive \
+  --profile span --vantage mirror_port --interface eth1
+```
+
+`--non-interactive` disables every prompt, including the enrollment token
+prompt. Omitting `--edition` skips the setup step altogether and installs
+exactly as previous versions did.
+
+### What the installer does
 
 This installs `trapd-sensord`/`trapd-sensorctl`, creates the `trapd-sensor`
 system user and `/etc/trapd-sensor`/`/var/lib/trapd-sensor`, installs the
@@ -71,10 +126,10 @@ sudo TRAPD_ENROLL_TOKEN="$(cat /path/to/token-file)" bash install.sh
 shred -u /path/to/token-file   # or rm -f, if shred isn't available
 ```
 
-Run `install.sh --help` for `--version`, `--force-enroll`, and `--skip-enroll`.
-Review `/etc/trapd-sensor/config.toml` before enrolling on a network where the
-default `balanced` mode or promiscuous capture isn't appropriate — see
-[Betriebsmodi](#betriebsmodi) below.
+Run `install.sh --help` for `--version`, `--force-enroll`, `--skip-enroll` and
+the setup pass-through flags. Review `/etc/trapd-sensor/config.toml` before
+enrolling on a network where the default `balanced` mode or promiscuous capture
+isn't appropriate — see [Betriebsmodi](#betriebsmodi) below.
 
 ### Manual install
 
@@ -82,16 +137,95 @@ Release assets also contain standalone binaries and DEB/RPM packages if you'd
 rather install by hand or through a package manager; see
 [deployment](docs/deployment.md) for the equivalent step-by-step commands.
 
+### Changing the network setup later
+
+`setup` is re-runnable and never requires a reinstall. It writes only the
+`[deployment]` block plus `capture.interfaces`/`capture.promiscuous`:
+
+```bash
+sudo trapd-sensorctl setup                                  # ask again
+sudo trapd-sensorctl setup --profile span --vantage mirror_port   # FRITZ!Box → SPAN
+sudo trapd-sensorctl setup --profile unifi                  # generic → UniFi
+sudo trapd-sensorctl setup --interface eth1                 # switch interface
+sudo trapd-sensorctl setup --dry-run --profile span         # show, write nothing
+trapd-sensorctl visibility                                  # what it can see, and why
+```
+
+Setup needs root because `/etc/trapd-sensor/config.toml` is `0640
+root:trapd-sensor`. It edits the file in place (comments survive), replaces it
+atomically, and keeps its owner and mode.
+
 ### Verifying and re-running diagnostics
 
 ```bash
 trapd-sensorctl status
+trapd-sensorctl visibility   # Sichtbarkeit + live: was gerade erfasst wird
 trapd-sensorctl diagnose     # Konfiguration, Rechte, Interfaces, Speicher
 trapd-sensord --check        # zeigt, was der Sensor mit dieser Config täte
 ```
 
 For automation, `trapd-sensorctl diagnose --json` emits a versioned report and
 uses exit codes 0 (OK), 1 (warnings), 2 (failed checks), and 3 (internal error).
+`trapd-sensorctl visibility --json` is versioned the same way, and the daemon
+serves the same information under `/admin/status`.
+
+---
+
+## Visibility
+
+A sensor's reach is decided by where it is attached, not by how many modules
+are switched on. `trapd-sensorctl visibility` derives that from the
+configuration and states it with a reason per line, so an empty DNS view is an
+answer instead of a bug hunt:
+
+```
+  ✓ Asset Discovery              4 of 4 broadcast/multicast sources (ARP/NDP, DHCP, mDNS, SSDP) are active …
+  ✓ New Device Detection         a device announces itself on the segment as soon as it joins …
+  ✓ Device Fingerprinting        DHCP options, mDNS/SSDP records and MAC vendor corroborate each other
+  ✓ Local Discovery (ARP/NDP)    IPv4 ARP and IPv6 Neighbor Discovery are evaluated
+  △ Gateway Visibility           the gateway is discovered like any other device, but its forwarded traffic is not visible from here
+  ✗ DNS Visibility               DNS is unicast between client and resolver — a switched LAN does not deliver it to this port
+  ✗ Internet Traffic Visibility  other hosts' uplink traffic never reaches a normal switch port
+  ✗ Internal Traffic Visibility  a switch forwards a conversation only to the two ports involved
+  ✗ Full Packet Visibility       needs a SPAN/mirror port or a network TAP
+```
+
+The vantage point (`deployment.vantage`) is what moves these lines:
+
+| Vantage | Discovery | DNS | Internet | Internal | Full frames |
+|---|---|---|---|---|---|
+| `lan_host` | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `gateway` | ✓ | △ | ✓ | △ | △ |
+| `mirror_port` / `network_tap` | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Three things also lower a line regardless of the vantage point: a disabled
+module (`passive.flows`, `passive.dns`), `privacy.dns_observation = false`, and
+`capture.promiscuous = false` — the last one silently reduces a mirror port to
+an ordinary LAN host, which `diagnose` reports as an error.
+
+Even at `✓ Full Packet Visibility` the sensor stores no payloads: it reads
+headers and named clear-text fields, and there is no code path that does
+otherwise. That note is printed on every report.
+
+### Supported network environments
+
+| Profile | What TRAPD does there |
+|---|---|
+| `fritzbox` | Passive discovery on the LAN. FRITZ!OS has no mirror port, so traffic visibility needs a managed switch or TAP; TRAPD says so instead of implying more. No FRITZ!Box login is used or needed. |
+| `unifi` | Same on the LAN; UniFi switches can mirror the uplink port — do that and re-run `setup --profile span`. No controller credentials are used. |
+| `opnsense` / `pfsense` | Sensor in the firewall's LAN segment, or on/behind the firewall where routed traffic passes (`--vantage gateway`). |
+| `openwrt` | Same, plus OpenWrt's own mirroring (tc/mirred, bridge mirror) as the path to full visibility. |
+| `span` | Managed switch mirror port or network TAP — full visibility of the mirrored segment. |
+| `generic` | Unknown platform: a plain switched LAN is assumed, nothing more is claimed. |
+| `manual` | Nothing recorded (the default for configs that never ran setup). |
+
+Optionally, setup can identify the gateway with a single unauthenticated HTTP
+request (TR-064 descriptor on port 49000, the page on port 80, plus a TCP
+connect to 443/8443). It is off unless confirmed at the prompt or requested
+with `--probe-gateway`, sends no credentials, never logs response bodies, and
+only ever contacts the host's own default gateway. The daemon does not probe
+anything — its operating mode and the three-key rule for active discovery are
+unchanged.
 
 ---
 
@@ -123,6 +257,11 @@ Der Admin-Endpunkt hört auf `127.0.0.1:9531` — Port über 1024, damit kein
 | `passive_only` | nie | SPAN-/Mirror-Port, sensible Umgebungen |
 | `balanced` | ICMP + Port-Allowlist | Homelab-Standard |
 | `active` | freier Port-Katalog, Banner, SNMP | bewusste Inventarisierung |
+
+Die Edition (`deployment.edition`) ist davon unabhängig: sie steuert nur die
+Einrichtung und die Darstellung. Eine Enterprise-Installation darf nichts, was
+eine Homelab-Installation nicht auch dürfte, und `trapd-sensorctl setup`
+schreibt weder `sensor.mode` noch irgendetwas unter `[active]`.
 
 Aktive Erkennung braucht **drei unabhängige Freigaben**:
 
@@ -198,6 +337,11 @@ Doppel fängt das Backend über `event_id` ab).
 
 ## Beobachtbarkeit
 
+`/admin/status` enthält zusätzlich `deployment` (Edition, Profil, Vantage) und
+die Sichtbarkeitsmatrix mit Begründungen — dieselbe Herleitung wie
+`trapd-sensorctl visibility`, damit Dashboard und CLI sich nicht widersprechen
+können.
+
 ```
 http://127.0.0.1:9531/admin/health    Liveness (hängt an nichts)
 http://127.0.0.1:9531/admin/ready     Readiness mit Begründung
@@ -264,6 +408,8 @@ Umgesetzt:
 - Enrollment, Bearer-Auth, Batch-Upload, Remote-Config
 - aktive Erkennung: ICMP, TCP-Connect, Banner, Rate-Limit, Scope-Prüfung
 - systemd-Packaging mit Least-Privilege-Härtung
+- Homelab-/Enterprise-Editionen mit geführtem bzw. flag-gesteuertem Setup und
+  hergeleiteter Sichtbarkeits-Auskunft
 - IPv6-Extension-Header und passive ICMPv6/NDP-Auswertung
 - defensives, rate-limitiertes SNMPv2c Read-only Discovery
 - CI mit Rustfmt, Clippy, Tests, RustSec, cargo-deny und Cross-Build
