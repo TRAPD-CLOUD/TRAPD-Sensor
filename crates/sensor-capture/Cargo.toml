@@ -13,6 +13,8 @@ libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+scraper = "0.27"
+serde_json.workspace = true
 md-5.workspace = true
 pbkdf2.workspace = true
 sha2.workspace = true

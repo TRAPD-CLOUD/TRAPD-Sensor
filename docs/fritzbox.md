@@ -31,8 +31,22 @@ Internet.
 ## Compatibility and limitations
 
 The capture CGI and page markup are undocumented FRITZ!OS internals and may
-change. Empty discovery results are a compatibility failure, not evidence that
-particular interfaces exist. Interface IDs are opaque and model-specific.
+change. Discovery therefore understands the semantic `data.lua?page=cap`
+response as well as standalone capture-page variants, and extracts opaque IDs
+from start controls or `ifaceorminor` parameters instead of matching interface
+names. Empty discovery results are a compatibility failure, not evidence that
+particular interfaces exist. The resulting error includes bounded response
+metadata and a short sanitized preview (session IDs are redacted), so a new
+firmware response can be identified without logging credentials. Interface IDs
+are opaque and model-specific.
+
+For a response summary even when discovery succeeds, run setup with capture
+debug logging enabled:
+
+```console
+sudo env RUST_LOG=trapd_sensor_capture=debug trapd-sensorctl setup --profile fritzbox
+```
+
 Multiple configured IDs run as independent workers. Some firmware may reject
 simultaneous captures; that source is then reported degraded rather than being
 silently discarded or taking down the other workers. The fixture set provides

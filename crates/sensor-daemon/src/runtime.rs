@@ -538,7 +538,10 @@ async fn run_fritzbox_session(
     let interfaces = session
         .capture_interfaces()
         .await
-        .map_err(|_| "interface_discovery_failed".to_string())?;
+        .map_err(|error| {
+            tracing::warn!(interface = interface_id, error = %error, "FRITZ!Box interface discovery failed");
+            "interface_discovery_failed".to_string()
+        })?;
     let interface = interfaces
         .into_iter()
         .find(|candidate| candidate.id == interface_id && candidate.available)
@@ -549,7 +552,10 @@ async fn run_fritzbox_session(
     let mut response = session
         .start_capture(&interface, config.max_packet_bytes)
         .await
-        .map_err(|_| "capture_endpoint_failed".to_string())?;
+        .map_err(|error| {
+            tracing::warn!(interface = interface_id, error = %error, "FRITZ!Box capture endpoint failed");
+            "capture_endpoint_failed".to_string()
+        })?;
     let mut decoder = PcapStreamDecoder::new(config.max_packet_bytes);
     let mut observer = PassiveObserver::new(
         format!("fritzbox:{interface_id}"),
