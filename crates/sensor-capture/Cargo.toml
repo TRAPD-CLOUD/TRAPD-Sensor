@@ -12,6 +12,12 @@ authors.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+md-5.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
