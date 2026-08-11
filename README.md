@@ -41,34 +41,51 @@ wie man hineinkommt.
 ## Installation
 
 Supported production platforms are current systemd-based Debian/Ubuntu and
-RHEL/Fedora/Rocky Linux on AMD64 or ARM64. Release assets contain standalone
-binaries plus DEB/RPM packages; see [deployment](docs/deployment.md).
+RHEL/Fedora/Rocky Linux on AMD64 or ARM64.
+
+### Homelab quickstart
 
 ```bash
-# Paket installieren (siehe packaging/)
-sudo install -m 0755 target/release/trapd-sensord    /usr/bin/
-sudo install -m 0755 target/release/trapd-sensorctl  /usr/bin/
-
-sudo install -m 0644 packaging/systemd/trapd-sensor.service  /etc/systemd/system/
-sudo install -m 0644 packaging/systemd/trapd-sensor.sysusers /usr/lib/sysusers.d/trapd-sensor.conf
-sudo install -m 0644 packaging/systemd/trapd-sensor.tmpfiles /usr/lib/tmpfiles.d/trapd-sensor.conf
-sudo systemd-sysusers && sudo systemd-tmpfiles --create
-
-sudo install -m 0640 -g trapd-sensor packaging/config.example.toml /etc/trapd-sensor/config.toml
-sudoedit /etc/trapd-sensor/config.toml
+curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash
 ```
 
-Enrollment mit einem Einmal-Token aus dem Dashboard:
+This installs `trapd-sensord`/`trapd-sensorctl`, creates the `trapd-sensor`
+system user and `/etc/trapd-sensor`/`/var/lib/trapd-sensor`, installs the
+systemd unit and grants `CAP_NET_RAW`/`CAP_NET_ADMIN`, then prompts for an
+enrollment token (hidden input — press enter to skip and enroll later) before
+starting the service and printing `trapd-sensorctl status` + `diagnose`. It's
+idempotent: re-running it upgrades the binaries and unit in place without
+touching an existing `config.toml` or the enrolled identity in
+`/var/lib/trapd-sensor`.
+
+The interactive prompt above is the only form that never puts the token in
+shell history — typing `TRAPD_ENROLL_TOKEN=enroll_xxx ...` at a live prompt
+records that whole line regardless of the env-var indirection. For
+non-interactive/automated enrollment, keep the token in a file (e.g. written
+by your provisioning tool) and read it from there so only the file path, not
+the token, ends up in history:
 
 ```bash
-sudo -u trapd-sensor trapd-sensorctl enroll --token enroll_xxxxxxxxxxxx
-sudo systemctl enable --now trapd-sensor
+curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh -o install.sh
+sudo TRAPD_ENROLL_TOKEN="$(cat /path/to/token-file)" bash install.sh
+shred -u /path/to/token-file   # or rm -f, if shred isn't available
+```
+
+Run `install.sh --help` for `--version`, `--force-enroll`, and `--skip-enroll`.
+Review `/etc/trapd-sensor/config.toml` before enrolling on a network where the
+default `balanced` mode or promiscuous capture isn't appropriate — see
+[Betriebsmodi](#betriebsmodi) below.
+
+### Manual install
+
+Release assets also contain standalone binaries and DEB/RPM packages if you'd
+rather install by hand or through a package manager; see
+[deployment](docs/deployment.md) for the equivalent step-by-step commands.
+
+### Verifying and re-running diagnostics
+
+```bash
 trapd-sensorctl status
-```
-
-Vor dem ersten Start lohnt sich:
-
-```bash
 trapd-sensorctl diagnose     # Konfiguration, Rechte, Interfaces, Speicher
 trapd-sensord --check        # zeigt, was der Sensor mit dieser Config täte
 ```

@@ -101,11 +101,19 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Stage installer assets
+        # packaging/ (systemd unit, sysusers, tmpfiles, example config) is
+        # arch-independent, so it's built once here rather than per matrix
+        # leg. scripts/install.sh fetches this tarball at install time.
+        run: |
+          tar -czf dist/packaging.tar.gz packaging
+          install -m 0755 scripts/install.sh dist/install.sh
       - uses: anchore/sbom-action/download-syft@v0
       - run: |
           syft dir:dist -o spdx-json=dist/SBOM.spdx.json
