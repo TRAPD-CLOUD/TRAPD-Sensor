@@ -571,7 +571,7 @@ fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
 
     let result = (|| -> anyhow::Result<()> {
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
-        chown(&temporary, uid, gid)?;
+        adopt_ownership(&temporary, path, uid, gid);
         std::fs::rename(&temporary, path)?;
         Ok(())
     })();
@@ -579,6 +579,35 @@ fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Gives the replacement file the ownership the original had.
+///
+/// Only when it differs: writing a config the caller already owns — a
+/// non-packaged path, a test, a `--config` somewhere else — needs no `chown`,
+/// and an unprivileged caller is not allowed to make one. Failing there would
+/// refuse a write that is perfectly legitimate.
+///
+/// A failure that *does* matter is the packaged path: `0640 root:trapd-sensor`
+/// losing its group means `trapd-sensord` can no longer read its own
+/// configuration. That is worth saying out loud, but it is still not a reason
+/// to throw away the operator's edit — the file is written either way, and the
+/// warning names the fix.
+fn adopt_ownership(temporary: &Path, target: &Path, uid: u32, gid: u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let already_correct = std::fs::metadata(temporary)
+        .map(|metadata| metadata.uid() == uid && metadata.gid() == gid)
+        .unwrap_or(false);
+    if already_correct {
+        return;
+    }
+    if let Err(error) = chown(temporary, uid, gid) {
+        eprintln!(
+            "warning: {error}. Re-run setup as root if trapd-sensord cannot read {} afterwards.",
+            target.display()
+        );
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -878,8 +907,13 @@ mod tests {
         );
     }
 
+    /// A config that does not exist yet is created with the packaged
+    /// permissions. The ownership it aims for is `root:trapd-sensor`, which an
+    /// unprivileged caller cannot set — that must warn, not abort, or setup
+    /// would refuse to write any config path outside `/etc` (and this test
+    /// would only pass as root).
     #[test]
-    fn a_missing_config_file_is_created() {
+    fn a_missing_config_file_is_created_even_without_the_right_to_chown() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");
 
@@ -894,6 +928,28 @@ mod tests {
                 .mode()
                 & 0o7777,
             0o640
+        );
+    }
+
+    /// The caller already owns the file, so there is nothing to chown and
+    /// nothing that may fail — the common case for every non-packaged path.
+    #[test]
+    fn rewriting_a_file_the_caller_owns_needs_no_ownership_change() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[sensor]\nname = \"a\"\n").expect("write");
+        let before = std::fs::metadata(&path).expect("metadata");
+
+        write_config(&path, &plan()).expect("write config");
+
+        let after = std::fs::metadata(&path).expect("metadata");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(
+            after.permissions().mode() & 0o7777,
+            before.permissions().mode() & 0o7777,
+            "an existing file keeps the mode it had"
         );
     }
 
