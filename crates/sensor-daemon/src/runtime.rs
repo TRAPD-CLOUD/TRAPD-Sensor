@@ -556,7 +556,13 @@ async fn run_fritzbox_session(
             tracing::warn!(interface = interface_id, error = %error, "FRITZ!Box capture endpoint failed");
             "capture_endpoint_failed".to_string()
         })?;
+    let response_diagnostic =
+        trapd_sensor_capture::fritzbox::describe_capture_response(&response);
+    tracing::debug!(interface = interface_id, response = %response_diagnostic, "FRITZ!Box capture response received");
     let mut decoder = PcapStreamDecoder::new(config.max_packet_bytes);
+    // Only the first bytes of the stream, and only until the decoder proves the
+    // stream is real PCAP — captured traffic payloads must never be logged.
+    let mut preview: Vec<u8> = Vec::with_capacity(64);
     let mut observer = PassiveObserver::new(
         format!("fritzbox:{interface_id}"),
         context.policy.clone(),
@@ -586,10 +592,30 @@ async fn run_fritzbox_session(
             context.state.update_fritzbox(|h| h.stream_error_count += 1);
             break 'capture Err("stream_eof".into());
         };
+        if decoder.link_type().is_none() && preview.len() < 64 {
+            let take = (64 - preview.len()).min(chunk.len());
+            preview.extend_from_slice(&chunk[..take]);
+        }
         let packets = match decoder.push(&chunk) {
             Ok(packets) => packets,
-            Err(_) => {
+            Err(error) => {
                 context.state.update_fritzbox(|h| h.parser_error_count += 1);
+                let reason = trapd_sensor_capture::fritzbox::classify_non_pcap(
+                    &response_diagnostic.content_type,
+                    &preview,
+                );
+                tracing::warn!(
+                    interface = interface_id,
+                    error = %error,
+                    reason = %reason,
+                    response = %response_diagnostic,
+                    "FRITZ!Box capture stream did not decode as PCAP"
+                );
+                tracing::debug!(
+                    interface = interface_id,
+                    preview = %trapd_sensor_capture::fritzbox::preview_stream_bytes(&preview),
+                    "FRITZ!Box capture stream preview"
+                );
                 break 'capture Err("malformed_pcap".to_string());
             }
         };

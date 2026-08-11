@@ -234,6 +234,104 @@ impl FritzBoxSession<'_> {
     }
 }
 
+/// Bounded, credential-safe summary of a capture response, used to diagnose a
+/// stream that failed to parse as PCAP. Never carries the SID, cookies, or
+/// authorization headers — only status, content-type, content-length, and the
+/// (SID-redacted) request URL.
+#[derive(Debug)]
+pub struct CaptureResponseDiagnostic {
+    pub status: StatusCode,
+    pub content_type: String,
+    pub content_length: Option<u64>,
+    pub url: String,
+}
+
+impl std::fmt::Display for CaptureResponseDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HTTP {}, content-type={}, content-length={}, url={}",
+            self.status,
+            self.content_type,
+            self.content_length
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "(unknown)".to_owned()),
+            self.url,
+        )
+    }
+}
+
+/// Captures response metadata before the body is streamed. Safe to log at any
+/// level: the URL has its `sid` query parameter redacted, and no headers other
+/// than `Content-Type` are read.
+pub fn describe_capture_response(response: &reqwest::Response) -> CaptureResponseDiagnostic {
+    CaptureResponseDiagnostic {
+        status: response.status(),
+        content_type: response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("(missing)")
+            .to_owned(),
+        content_length: response.content_length(),
+        url: redact_parameter(response.url().as_str(), "sid"),
+    }
+}
+
+/// Bounded hex + ASCII preview of the first bytes of a capture stream. Only
+/// feed this bytes captured *before* the decoder has produced a first packet:
+/// once real Ethernet frames are flowing, their payloads must never be
+/// logged. Verbose by design — callers should gate this behind debug logging.
+pub fn preview_stream_bytes(bytes: &[u8]) -> String {
+    let take = bytes.len().min(64);
+    let hex = bytes[..take]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ascii: String = bytes[..take]
+        .iter()
+        .map(|&byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    format!("{take} bytes: hex=[{hex}] ascii=\"{ascii}\"")
+}
+
+/// Best-effort, credential-safe reason a capture stream is not PCAP: checks
+/// the declared content-type first, then the shape of the leading bytes.
+pub fn classify_non_pcap(content_type: &str, bytes: &[u8]) -> String {
+    let lower = content_type.to_ascii_lowercase();
+    if lower.contains("html") {
+        return format!(
+            "content-type is {content_type} — likely an HTML login or error page, not a PCAP stream"
+        );
+    }
+    if lower.contains("json") {
+        return format!(
+            "content-type is {content_type} — likely a JSON error response, not a PCAP stream"
+        );
+    }
+    if bytes
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'<')
+    {
+        return "response body starts with '<' — likely HTML/XML, not a PCAP stream".to_owned();
+    }
+    match bytes.get(0..4) {
+        Some(magic) => format!(
+            "unexpected magic bytes {:02x} {:02x} {:02x} {:02x} (expected d4c3b2a1 / a1b2c3d4, or the nanosecond variants)",
+            magic[0], magic[1], magic[2], magic[3]
+        ),
+        None => "stream ended before a PCAP global header could be read".to_owned(),
+    }
+}
+
 async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
     if response
         .content_length()
@@ -759,6 +857,66 @@ mod tests {
     #[test]
     fn malformed_session_xml() {
         assert_eq!(tag("<SID>x", "SID"), None)
+    }
+
+    #[test]
+    fn classify_flags_html_content_type_before_inspecting_bytes() {
+        let reason = classify_non_pcap("text/html; charset=utf-8", b"whatever");
+        assert!(reason.contains("HTML"), "{reason}");
+    }
+
+    #[test]
+    fn classify_flags_html_like_bodies_with_generic_content_type() {
+        let reason = classify_non_pcap(
+            "application/octet-stream",
+            b"<!DOCTYPE html><html><body>login</body></html>",
+        );
+        assert!(reason.contains("HTML/XML"), "{reason}");
+    }
+
+    #[test]
+    fn classify_reports_unexpected_magic_bytes() {
+        let reason = classify_non_pcap("application/octet-stream", &[0, 1, 2, 3]);
+        assert!(reason.contains("unexpected magic bytes"), "{reason}");
+    }
+
+    #[test]
+    fn preview_bounds_to_64_bytes_and_masks_non_printable() {
+        let bytes: Vec<u8> = (0u8..100).collect();
+        let preview = preview_stream_bytes(&bytes);
+        assert!(preview.starts_with("64 bytes:"));
+        assert!(preview.contains(".")); // control bytes rendered as '.'
+    }
+
+    #[tokio::test]
+    async fn describe_capture_response_redacts_sid_and_reports_content_type() {
+        let body = "<html><body>login required</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response: &'static str = Box::leak(response.into_boxed_str());
+        let (address, server) = fixture_server(vec![response]).await;
+        let client =
+            FritzBoxClient::new(&address, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let session = FritzBoxSession {
+            client: &client,
+            sid: "0123456789abcdef".into(),
+        };
+        let interface = CaptureInterface {
+            id: "4-138".into(),
+            display_name: "opaque".into(),
+            category: "router".into(),
+            available: true,
+        };
+
+        let response = session.start_capture(&interface, 1600).await.unwrap();
+        let diagnostic = describe_capture_response(&response);
+        assert_eq!(diagnostic.status, StatusCode::OK);
+        assert_eq!(diagnostic.content_type, "text/html");
+        assert!(!diagnostic.url.contains("0123456789abcdef"));
+        assert!(diagnostic.url.contains("[REDACTED]"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
