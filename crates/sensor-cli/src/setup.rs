@@ -403,8 +403,11 @@ async fn configure_fritzbox(
                             }
                         }
                     }
-                    Ok(_) => Err("router advertised no capture interfaces".into()),
-                    Err(_) => Err("interface discovery failed".into()),
+                    Ok(_) => Err(
+                        "router advertised no capture interfaces (no diagnostic response was returned)"
+                            .into(),
+                    ),
+                    Err(error) => Err(format!("interface discovery failed: {error}")),
                 },
                 Err(_) => Err("authentication failed".into()),
             },
@@ -430,14 +433,14 @@ async fn validate_capture(
     let mut response = session
         .start_capture(interface, max_packet)
         .await
-        .map_err(|_| "capture endpoint unavailable".to_string())?;
+        .map_err(|error| format!("capture endpoint unavailable: {error}"))?;
     let mut decoder = trapd_sensor_capture::fritzbox::PcapStreamDecoder::new(max_packet);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         let chunk = tokio::time::timeout_at(deadline, response.chunk())
             .await
             .map_err(|_| "capture test timed out".to_string())?
-            .map_err(|_| "capture stream failed".to_string())?
+            .map_err(|error| format!("capture stream failed: {error}"))?
             .ok_or_else(|| "capture stream closed".to_string())?;
         if !decoder
             .push(&chunk)

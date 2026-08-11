@@ -126,10 +126,10 @@ async fn check_fritzbox(report: &mut Report, config: &SensorConfig) {
                     "authentication failed",
                 ),
                 Ok(session) => match session.capture_interfaces().await {
-                    Err(_) => report.push(
+                    Err(error) => report.push(
                         "capture.fritzbox.interfaces",
                         CheckStatus::Error,
-                        "interface discovery failed",
+                        format!("interface discovery failed: {error}"),
                     ),
                     Ok(found) => {
                         let missing: Vec<_> = fb
