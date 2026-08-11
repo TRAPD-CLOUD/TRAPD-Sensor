@@ -133,4 +133,10 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes
+        run: |
+          # A prior attempt at this tag (manual or a failed run that got as
+          # far as release creation) may have left a release object behind;
+          # `gh release create` refuses to touch an existing one. Clear it
+          # first (leaves the tag itself alone) so re-tagging is idempotent.
+          gh release delete "${{ github.ref_name }}" --yes || true
+          gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes
