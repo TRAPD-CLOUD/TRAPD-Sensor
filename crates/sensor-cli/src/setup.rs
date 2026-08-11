@@ -434,7 +434,15 @@ async fn validate_capture(
         .start_capture(interface, max_packet)
         .await
         .map_err(|error| format!("capture endpoint unavailable: {error}"))?;
+    // Metadata only (status/content-type/content-length/redacted URL) — safe
+    // to keep around and include directly in the error shown to the operator.
+    let response_diagnostic = trapd_sensor_capture::fritzbox::describe_capture_response(&response);
+    tracing::debug!(response = %response_diagnostic, "FRITZ!Box capture response received");
+
     let mut decoder = trapd_sensor_capture::fritzbox::PcapStreamDecoder::new(max_packet);
+    // Only the first bytes of the stream, and only until the decoder proves the
+    // stream is real PCAP — captured traffic payloads must never be logged.
+    let mut preview: Vec<u8> = Vec::with_capacity(64);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         let chunk = tokio::time::timeout_at(deadline, response.chunk())
@@ -442,16 +450,32 @@ async fn validate_capture(
             .map_err(|_| "capture test timed out".to_string())?
             .map_err(|error| format!("capture stream failed: {error}"))?
             .ok_or_else(|| "capture stream closed".to_string())?;
-        if !decoder
-            .push(&chunk)
-            .map_err(|_| "invalid PCAP stream".to_string())?
-            .is_empty()
-        {
-            return if decoder.link_type() == Some(1) {
-                Ok(())
-            } else {
-                Err("capture is not Ethernet PCAP".into())
-            };
+        if decoder.link_type().is_none() && preview.len() < 64 {
+            let take = (64 - preview.len()).min(chunk.len());
+            preview.extend_from_slice(&chunk[..take]);
+        }
+        match decoder.push(&chunk) {
+            Ok(packets) if !packets.is_empty() => {
+                return if decoder.link_type() == Some(1) {
+                    Ok(())
+                } else {
+                    Err("capture is not Ethernet PCAP".into())
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    preview = %trapd_sensor_capture::fritzbox::preview_stream_bytes(&preview),
+                    "FRITZ!Box capture stream did not decode as PCAP"
+                );
+                let reason = trapd_sensor_capture::fritzbox::classify_non_pcap(
+                    &response_diagnostic.content_type,
+                    &preview,
+                );
+                return Err(format!(
+                    "invalid PCAP stream: {error} — {reason} ({response_diagnostic})"
+                ));
+            }
         }
     }
     Err("no packet received during capture test".into())
