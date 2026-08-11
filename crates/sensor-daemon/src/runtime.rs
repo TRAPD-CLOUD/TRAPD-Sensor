@@ -224,6 +224,8 @@ impl Daemon {
                     interface,
                     fb.clone(),
                     policy.clone(),
+                    self.config.capture.flow_window_secs,
+                    self.config.capture.max_tracked_flows,
                     obs_tx.clone(),
                     self.state.clone(),
                     producer_shutdown.clone(),
@@ -468,6 +470,8 @@ async fn run_fritzbox_capture(
     interface_id: String,
     config: trapd_sensor_core::config::FritzBoxCaptureConfig,
     policy: trapd_sensor_core::config::EffectivePolicy,
+    flow_window_secs: u64,
+    max_tracked_flows: usize,
     obs_tx: mpsc::Sender<Observation>,
     state: Arc<SensorState>,
     mut shutdown: watch::Receiver<bool>,
@@ -485,6 +489,8 @@ async fn run_fritzbox_capture(
             &interface_id,
             &config,
             &policy,
+            flow_window_secs,
+            max_tracked_flows,
             &obs_tx,
             &state,
             &mut shutdown,
@@ -512,6 +518,8 @@ async fn run_fritzbox_session(
     interface_id: &str,
     config: &trapd_sensor_core::config::FritzBoxCaptureConfig,
     policy: &trapd_sensor_core::config::EffectivePolicy,
+    flow_window_secs: u64,
+    max_tracked_flows: usize,
     obs_tx: &mpsc::Sender<Observation>,
     state: &Arc<SensorState>,
     shutdown: &mut watch::Receiver<bool>,
@@ -545,36 +553,47 @@ async fn run_fritzbox_session(
         .ok_or_else(|| "configured_interface_unavailable".to_string())?;
     state.update_fritzbox(|h| h.state = "connecting".into());
     let mut response = session
-        .start_capture(&interface)
+        .start_capture(&interface, config.max_packet_bytes)
         .await
         .map_err(|_| "capture_endpoint_failed".to_string())?;
     let mut decoder = PcapStreamDecoder::new(config.max_packet_bytes);
     let mut observer = PassiveObserver::new(
         format!("fritzbox:{interface_id}"),
         policy.clone(),
-        60,
-        50_000,
+        flow_window_secs,
+        max_tracked_flows,
     );
     let mut active = false;
-    loop {
+    let result = 'capture: loop {
         let chunk = tokio::select! {
-            result = response.chunk() => result.map_err(|_| "stream_error".to_string())?,
-            _ = shutdown.changed() => { if *shutdown.borrow() { if active { state.fritzbox_interface_down(interface_id); } return Ok(()); } continue; }
+            result = response.chunk() => match result {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    state.update_fritzbox(|h| h.stream_error_count += 1);
+                    break 'capture Err("stream_error".to_string());
+                }
+            },
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break 'capture Ok(());
+                }
+                continue;
+            }
         };
         let Some(chunk) = chunk else {
-            if active {
-                state.fritzbox_interface_down(interface_id);
-            }
             state.update_fritzbox(|h| h.stream_error_count += 1);
-            return Err("stream_eof".into());
+            break 'capture Err("stream_eof".into());
         };
-        let packets = decoder.push(&chunk).map_err(|_| {
-            state.update_fritzbox(|h| h.parser_error_count += 1);
-            "malformed_pcap".to_string()
-        })?;
+        let packets = match decoder.push(&chunk) {
+            Ok(packets) => packets,
+            Err(_) => {
+                state.update_fritzbox(|h| h.parser_error_count += 1);
+                break 'capture Err("malformed_pcap".to_string());
+            }
+        };
         if let Some(link_type) = decoder.link_type() {
             if link_type != 1 {
-                return Err("unsupported_link_type".into());
+                break 'capture Err("unsupported_link_type".into());
             }
         }
         for packet in packets {
@@ -591,14 +610,26 @@ async fn run_fritzbox_session(
             });
             for observation in observer.handle_frame(&packet.data, chrono::Utc::now()) {
                 if obs_tx.send(observation).await.is_err() {
-                    if active {
-                        state.fritzbox_interface_down(interface_id);
-                    }
-                    return Ok(());
+                    break 'capture Ok(());
                 }
             }
         }
+        for observation in observer.expire(chrono::Utc::now()) {
+            if obs_tx.send(observation).await.is_err() {
+                break 'capture Ok(());
+            }
+        }
+    };
+
+    for observation in observer.drain() {
+        if obs_tx.send(observation).await.is_err() {
+            break;
+        }
     }
+    if active {
+        state.fritzbox_interface_down(interface_id);
+    }
+    result
 }
 
 /// Der einzige Ort, an dem aus einer Beobachtung ein Event wird.
@@ -860,6 +891,8 @@ mod fritzbox_tests {
             "lan",
             &config,
             &trapd_sensor_core::config::SensorConfig::default().effective_policy(),
+            60,
+            50_000,
             &tx,
             &state,
             &mut shutdown,

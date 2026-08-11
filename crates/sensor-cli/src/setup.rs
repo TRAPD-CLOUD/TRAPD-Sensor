@@ -278,22 +278,28 @@ pub async fn run(config_path: &Path, config: &SensorConfig, args: SetupArgs) -> 
         }
     }
 
+    let credentials_changed = new_credentials.is_some();
+    if let Some(credentials) = &new_credentials {
+        let store = trapd_sensor_capture::fritzbox::SecretStore::new(
+            &config.capture.fritzbox.credentials_file,
+        );
+        store
+            .save(credentials)
+            .context("could not save FRITZ!Box credentials")?;
+        adopt_secret_ownership(store.path());
+    }
+
     let unchanged = plan == Plan::from_config(config);
     if unchanged && config.deployment.is_configured() {
         println!(
             "configuration already matches — {} unchanged",
             config_path.display()
         );
-    } else {
-        if let Some(credentials) = &new_credentials {
-            let store = trapd_sensor_capture::fritzbox::SecretStore::new(
-                &config.capture.fritzbox.credentials_file,
-            );
-            store
-                .save(credentials)
-                .context("could not save FRITZ!Box credentials")?;
-            adopt_secret_ownership(store.path());
+        if credentials_changed {
+            println!("updated FRITZ!Box credentials");
+            println!("apply them with: systemctl restart trapd-sensor");
         }
+    } else {
         write_config(config_path, &plan)?;
         println!("wrote {}", config_path.display());
         println!("apply it with: systemctl restart trapd-sensor");
@@ -422,7 +428,7 @@ async fn validate_capture(
     max_packet: usize,
 ) -> Result<(), String> {
     let mut response = session
-        .start_capture(interface)
+        .start_capture(interface, max_packet)
         .await
         .map_err(|_| "capture endpoint unavailable".to_string())?;
     let mut decoder = trapd_sensor_capture::fritzbox::PcapStreamDecoder::new(max_packet);

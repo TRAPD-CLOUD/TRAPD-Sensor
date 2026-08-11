@@ -127,6 +127,7 @@ impl FritzBoxSession<'_> {
     pub async fn start_capture(
         &self,
         interface: &CaptureInterface,
+        max_packet_bytes: usize,
     ) -> Result<reqwest::Response, FritzBoxError> {
         if !interface.available || interface.id.is_empty() {
             return Err(FritzBoxError::UnknownInterface);
@@ -136,6 +137,7 @@ impl FritzBoxSession<'_> {
             .base
             .join("cgi-bin/capture_notimeout")
             .map_err(|_| FritzBoxError::InvalidAddress)?;
+        let snaplen = max_packet_bytes.to_string();
         let response = self
             .client
             .http
@@ -143,7 +145,7 @@ impl FritzBoxSession<'_> {
             .query(&[
                 ("sid", self.sid.as_str()),
                 ("capture", interface.id.as_str()),
-                ("snaplen", "1600"),
+                ("snaplen", snaplen.as_str()),
             ])
             .send()
             .await?;

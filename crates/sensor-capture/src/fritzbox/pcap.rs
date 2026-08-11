@@ -54,14 +54,29 @@ impl PcapStreamDecoder {
             .max_packet
             .checked_add(GLOBAL + RECORD)
             .ok_or(PcapError::BufferLimit)?;
-        if self.buffer.len().saturating_add(bytes.len()) > limit {
-            return Err(PcapError::BufferLimit);
-        }
-        self.buffer.extend_from_slice(bytes);
         let mut packets = Vec::new();
+        let mut remaining = bytes;
+
+        while !remaining.is_empty() {
+            let available = limit
+                .checked_sub(self.buffer.len())
+                .ok_or(PcapError::BufferLimit)?;
+            if available == 0 {
+                return Err(PcapError::BufferLimit);
+            }
+            let accepted = available.min(remaining.len());
+            self.buffer.extend_from_slice(&remaining[..accepted]);
+            remaining = &remaining[accepted..];
+            self.decode_available(&mut packets)?;
+        }
+
+        Ok(packets)
+    }
+
+    fn decode_available(&mut self, packets: &mut Vec<PcapPacket>) -> Result<(), PcapError> {
         if self.endian.is_none() {
             if self.buffer.len() < GLOBAL {
-                return Ok(packets);
+                return Ok(());
             }
             self.endian = Some(match self.buffer[0..4] {
                 [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => Endianness::Little,
@@ -101,7 +116,7 @@ impl PcapStreamDecoder {
             });
             self.buffer.drain(..total);
         }
-        Ok(packets)
+        Ok(())
     }
     pub fn finish(self) -> Result<(), PcapError> {
         if self.buffer.is_empty() && self.endian.is_some() {
@@ -178,6 +193,16 @@ mod tests {
         assert_eq!(PcapStreamDecoder::new(64).push(&stream()).unwrap().len(), 2)
     }
     #[test]
+    fn chunk_larger_than_receive_buffer_is_consumed_incrementally() {
+        let mut bytes = stream();
+        let records = bytes.split_off(GLOBAL);
+        for _ in 0..10 {
+            bytes.extend_from_slice(&records);
+        }
+        assert!(bytes.len() > 64 + GLOBAL + RECORD);
+        assert_eq!(PcapStreamDecoder::new(64).push(&bytes).unwrap().len(), 20);
+    }
+    #[test]
     fn oversized_snaplen() {
         let mut b = stream();
         b[16] = 65;
@@ -201,10 +226,5 @@ mod tests {
         let mut d = PcapStreamDecoder::new(64);
         d.push(&b[..30]).unwrap();
         assert_eq!(d.finish(), Err(PcapError::Truncated));
-    }
-    #[test]
-    fn bounded() {
-        let mut d = PcapStreamDecoder::new(64);
-        assert_eq!(d.push(&[0; 200]), Err(PcapError::BufferLimit));
     }
 }

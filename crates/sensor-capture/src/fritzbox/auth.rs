@@ -53,7 +53,7 @@ pub fn challenge_response(
         pbkdf2_hmac::<Sha256>(&first, &salt2, iter2, &mut second);
         Ok((
             ChallengeKind::Pbkdf2,
-            format!("{challenge}${}", hex(&second)),
+            format!("2${}${}", fields[4], hex(&second)),
         ))
     } else {
         if challenge.is_empty() || challenge.len() > 1024 || challenge.chars().any(char::is_control)
@@ -97,7 +97,10 @@ mod tests {
     fn modern_is_stable() {
         let (_, value) =
             challenge_response("2$1000$0011223344556677$1000$8899aabbccddeeff", "secret").unwrap();
-        assert_eq!(value, "2$1000$0011223344556677$1000$8899aabbccddeeff$b588104a34879e8ebe742de4a1b811c1c405d1acd0e0bf2e2bdacd9579426021");
+        assert_eq!(
+            value,
+            "2$8899aabbccddeeff$b588104a34879e8ebe742de4a1b811c1c405d1acd0e0bf2e2bdacd9579426021"
+        );
     }
     #[test]
     fn malformed_modern_is_rejected() {
