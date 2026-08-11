@@ -155,12 +155,7 @@ fn check_service(report: &mut Report, config: &SensorConfig) {
             "trapd-sensor user not found (expected in package installations)"
         },
     );
-    let unit = [
-        "/etc/systemd/system/trapd-sensor.service",
-        "/usr/lib/systemd/system/trapd-sensor.service",
-    ]
-    .iter()
-    .any(|p| Path::new(p).exists());
+    let unit = UNIT_PATHS.iter().any(|p| Path::new(p).exists());
     report.push(
         "service.systemd",
         if unit {
@@ -181,26 +176,50 @@ fn check_service(report: &mut Report, config: &SensorConfig) {
     );
 }
 
+const UNIT_PATHS: [&str; 2] = [
+    "/etc/systemd/system/trapd-sensor.service",
+    "/usr/lib/systemd/system/trapd-sensor.service",
+];
+
+/// `diagnose` runs as `trapd-sensorctl`, a different binary than the daemon
+/// it is inspecting — reading `/proc/self/status` here would report
+/// `sensorctl`'s own (empty) capability set, not what `trapd-sensord` will
+/// actually get at startup. So instead this looks at the two ways the daemon
+/// can obtain capabilities: file capabilities on its binary (the `setcap`
+/// path from the README) and `AmbientCapabilities=` in the installed
+/// systemd unit (the packaged path).
 fn check_capabilities(report: &mut Report, config: &SensorConfig) {
-    let effective = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix("CapEff:\t")
-                    .and_then(|v| u64::from_str_radix(v, 16).ok())
-            })
+    let daemon_path = daemon_binary_path();
+    let source = file_capabilities(&daemon_path)
+        .map(|caps| {
+            (
+                caps,
+                format!("file capabilities on {}", daemon_path.display()),
+            )
         })
-        .unwrap_or(0);
-    for (id, bit, name, required) in [
-        ("cap.net_raw", 13, "CAP_NET_RAW", true),
-        (
-            "cap.net_admin",
-            12,
-            "CAP_NET_ADMIN",
-            config.capture.promiscuous,
-        ),
+        .or_else(|| {
+            systemd_ambient_capabilities().map(|caps| {
+                (
+                    caps,
+                    "AmbientCapabilities= in the installed systemd unit".to_string(),
+                )
+            })
+        });
+
+    for (id, name, required) in [
+        ("cap.net_raw", "CAP_NET_RAW", true),
+        ("cap.net_admin", "CAP_NET_ADMIN", config.capture.promiscuous),
     ] {
-        let present = effective & (1u64 << bit) != 0;
+        let (present, detail) = match &source {
+            Some((caps, origin)) => (caps.contains(name), origin.clone()),
+            None => (
+                false,
+                format!(
+                    "neither file capabilities on {} nor a systemd unit with AmbientCapabilities= were found",
+                    daemon_path.display()
+                ),
+            ),
+        };
         let status = if present {
             CheckStatus::Ok
         } else if required {
@@ -212,11 +231,82 @@ fn check_capabilities(report: &mut Report, config: &SensorConfig) {
             id,
             status,
             format!(
-                "{name} {} (effective mask 0x{effective:016x})",
+                "{name} {} ({detail})",
                 if present { "available" } else { "missing" }
             ),
         );
     }
+}
+
+/// Where the daemon this host will actually run lives. The systemd unit
+/// pins this exactly via `ExecStart=`; fall back to the documented default.
+fn daemon_binary_path() -> PathBuf {
+    for unit in UNIT_PATHS {
+        if let Ok(contents) = std::fs::read_to_string(unit) {
+            if let Some(path) = contents.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("ExecStart=")
+                    .and_then(|rest| rest.split_whitespace().next())
+            }) {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    PathBuf::from("/usr/bin/trapd-sensord")
+}
+
+/// Reads file capabilities via `getcap`, the standard way to inspect the
+/// `setcap` state the README instructs operators to set. `None` means the
+/// tool isn't available or the binary doesn't exist — not "no capabilities",
+/// which is a distinct, reportable state once a source is actually found.
+fn file_capabilities(path: &Path) -> Option<std::collections::HashSet<String>> {
+    if !path.exists() {
+        return None;
+    }
+    let output = std::process::Command::new("getcap")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_getcap_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses `getcap` output, e.g. `<path> cap_net_admin,cap_net_raw=eip`.
+/// No `=` means no capabilities are set.
+fn parse_getcap_output(text: &str) -> Option<std::collections::HashSet<String>> {
+    let caps_part = text.trim().split_once('=')?.0;
+    Some(
+        caps_part
+            .rsplit_once(' ')
+            .map(|(_, caps)| caps)
+            .unwrap_or(caps_part)
+            .split(',')
+            .map(|c| c.trim().to_uppercase())
+            .collect(),
+    )
+}
+
+/// Parses `AmbientCapabilities=` out of the installed unit, if present.
+fn systemd_ambient_capabilities() -> Option<std::collections::HashSet<String>> {
+    for unit in UNIT_PATHS {
+        if let Ok(contents) = std::fs::read_to_string(unit) {
+            if let Some(line) = contents
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("AmbientCapabilities="))
+            {
+                return Some(parse_ambient_capabilities_line(line));
+            }
+        }
+    }
+    None
+}
+
+fn parse_ambient_capabilities_line(line: &str) -> std::collections::HashSet<String> {
+    line.split_whitespace()
+        .map(|c| c.trim().to_uppercase())
+        .collect()
 }
 
 fn check_network(report: &mut Report, config: &SensorConfig) {
@@ -500,5 +590,25 @@ mod tests {
         let value = serde_json::to_value(r).unwrap();
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["checks"][0]["id"], "cap.net_raw");
+    }
+
+    #[test]
+    fn getcap_output_with_capabilities_is_parsed() {
+        let caps = parse_getcap_output("/usr/bin/trapd-sensord cap_net_admin,cap_net_raw=eip\n")
+            .expect("capabilities present");
+        assert!(caps.contains("CAP_NET_ADMIN"));
+        assert!(caps.contains("CAP_NET_RAW"));
+    }
+
+    #[test]
+    fn getcap_output_without_an_equals_sign_means_no_capabilities() {
+        assert!(parse_getcap_output("/usr/bin/trapd-sensord\n").is_none());
+    }
+
+    #[test]
+    fn ambient_capabilities_line_is_parsed_and_uppercased() {
+        let caps = parse_ambient_capabilities_line("CAP_NET_RAW CAP_NET_ADMIN");
+        assert!(caps.contains("CAP_NET_RAW"));
+        assert!(caps.contains("CAP_NET_ADMIN"));
     }
 }
