@@ -65,6 +65,27 @@ as_sensor() {
   fi
 }
 
+# Same as as_sensor, but forwards TRAPD_ENROLLMENT_TOKEN through the
+# environment instead of a CLI argument — trapd-sensorctl's `enroll --token`
+# would otherwise put the secret in this process's argv, readable by any
+# local user via `ps`/`/proc/<pid>/cmdline` for as long as the enroll
+# request is in flight. `enroll` already reads this exact variable (clap
+# `env = "TRAPD_ENROLLMENT_TOKEN"` on sensor-cli's --token), so this needs
+# no changes on the Rust side. runuser/su inherit the calling environment by
+# default (no -l/login-shell reset here); sudo does not, so it needs
+# --preserve-env explicitly.
+as_sensor_with_token() {
+  local token="$1"
+  shift
+  if command -v runuser >/dev/null 2>&1; then
+    TRAPD_ENROLLMENT_TOKEN="$token" runuser -u trapd-sensor -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    TRAPD_ENROLLMENT_TOKEN="$token" sudo --preserve-env=TRAPD_ENROLLMENT_TOKEN -u trapd-sensor "$@"
+  else
+    TRAPD_ENROLLMENT_TOKEN="$token" su -s /bin/sh trapd-sensor -c "$(printf '%q ' "$@")"
+  fi
+}
+
 # die() is for expected, already-explained failures (bad args, missing
 # prerequisites, a rejected token) — the message alone is the whole story,
 # so it disables the ERR trap first to avoid a second, generic "something
@@ -98,8 +119,11 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --token <TOKEN>     Enrollment token (prefer TRAPD_ENROLL_TOKEN env var
-                       instead, so the token never lands in shell history).
+  --token <TOKEN>     Enrollment token. Avoid this and TRAPD_ENROLL_TOKEN on
+                       a shared/interactive shell — both land in history if
+                       typed at a live prompt. Prefer the interactive hidden
+                       prompt (run with neither), or read the value from a
+                       file: TRAPD_ENROLL_TOKEN="$(cat token-file)".
   --version <TAG>     Install a specific release tag instead of latest,
                        e.g. --version v0.1.0. Default: latest.
   --force-enroll      Re-enroll even if this host already has an identity
@@ -279,9 +303,12 @@ else
 
   if [[ -n "$TOKEN" ]]; then
     log "enrolling with the TRAPD backend"
-    ENROLL_ARGS=(enroll --token "$TOKEN")
+    ENROLL_ARGS=(enroll)
     [[ "$FORCE_ENROLL" -eq 1 ]] && ENROLL_ARGS+=(--force)
-    if ! as_sensor "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
+    # Token goes through the environment (TRAPD_ENROLLMENT_TOKEN, which
+    # `enroll --token` already reads via clap's env fallback), not argv —
+    # see as_sensor_with_token's doc comment.
+    if ! as_sensor_with_token "$TOKEN" "${BIN_DIR}/trapd-sensorctl" "${ENROLL_ARGS[@]}"; then
       die "enrollment failed (see the error above — usually an expired/invalid token or an unreachable backend.api_url in ${CONFIG_DIR}/config.toml). Everything else is installed; fix the cause and re-run: sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
     fi
   fi
