@@ -42,6 +42,10 @@ pub struct SensorState {
     pub uploader: Arc<UploaderStats>,
 
     mode: Mutex<String>,
+    /// Vorgerechnete Deployment-/Sichtbarkeitsauskunft für `/admin/status`.
+    /// Der Zustand hält sie als fertiges JSON, damit der Admin-Endpunkt beim
+    /// Abruf nichts herleiten muss.
+    deployment: Mutex<Option<serde_json::Value>>,
     interfaces_up: AtomicU64,
     interfaces_configured: AtomicU64,
     packets_captured: AtomicU64,
@@ -73,6 +77,7 @@ impl SensorState {
             uptime: Uptime::start(),
             uploader: Arc::new(UploaderStats::default()),
             mode: Mutex::new(mode),
+            deployment: Mutex::new(None),
             interfaces_up: AtomicU64::new(0),
             interfaces_configured: AtomicU64::new(0),
             packets_captured: AtomicU64::new(0),
@@ -99,6 +104,15 @@ impl SensorState {
 
     pub fn mode(&self) -> String {
         self.mode.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    /// Hinterlegt, wie der Sensor am Netz hängt und was er dort sehen kann.
+    /// Wird beim Start einmal gesetzt; `/admin/status` gibt es unverändert
+    /// weiter, damit Dashboard und `trapd-sensorctl` dieselbe Auskunft sehen.
+    pub fn set_deployment(&self, deployment: serde_json::Value) {
+        if let Ok(mut slot) = self.deployment.lock() {
+            *slot = Some(deployment);
+        }
     }
 
     pub fn set_interfaces_up(&self, count: u64) {
@@ -463,6 +477,11 @@ impl SensorState {
                 "batches": uploader.batches_sent,
                 "failures": uploader.upload_failures,
             },
+            "deployment": self
+                .deployment
+                .lock()
+                .ok()
+                .and_then(|d| d.clone()),
             "active_discovery_disabled_reason": self
                 .active_disabled_reason
                 .lock()

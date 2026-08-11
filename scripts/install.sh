@@ -3,7 +3,31 @@
 #
 # Recommended usage (see README.md):
 #
-#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash
+#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash -s -- --edition homelab
+#   curl -fsSL https://github.com/TRAPD-CLOUD/TRAPD-Sensor/releases/latest/download/install.sh | sudo bash -s -- --edition enterprise
+#
+# The two editions are the same installation, differing only in how the
+# network setup is answered:
+#
+#   homelab     After installing, `trapd-sensorctl setup` asks how the network
+#               is managed (FRITZ!Box, UniFi, OPNsense, pfSense, OpenWrt, a
+#               managed switch with SPAN, or a plain router) and records the
+#               answer. No managed switch and no mirror port is required.
+#   enterprise  The same setup, driven entirely by flags (--profile, --vantage,
+#               --interface), so it finishes without a terminal. Combine with
+#               --non-interactive for fully unattended installs.
+#
+# Omitting --edition keeps the pre-edition behaviour exactly: install, enroll,
+# start, no setup step, no change to an existing config.toml.
+#
+# The edition can also come from TRAPD_EDITION. That is what makes a short URL
+# work without a second installer: an endpoint like install.trapd.cloud/homelab
+# serves this exact file with one line prepended,
+#
+#   TRAPD_EDITION=homelab
+#
+# so `curl -fsSL https://install.trapd.cloud/homelab | sudo bash` runs the same
+# script with the same logic.
 #
 # Without a token, the script still installs everything and prompts for one
 # interactively (input hidden, read from the controlling terminal so it works
@@ -39,6 +63,16 @@ VERSION="${TRAPD_SENSOR_VERSION:-latest}"
 TOKEN="${TRAPD_ENROLL_TOKEN:-}"
 FORCE_ENROLL=0
 SKIP_ENROLL=0
+# Empty means "no --edition given": skip the setup step entirely and behave
+# exactly as this installer did before editions existed. TRAPD_EDITION exists
+# so a short URL (install.trapd.cloud/homelab) can select an edition without
+# shipping a second installer.
+EDITION="${TRAPD_EDITION:-}"
+SETUP_PROFILE=""
+SETUP_VANTAGE=""
+SETUP_INTERFACES=()
+PROBE_GATEWAY=0
+NON_INTERACTIVE=0
 BIN_DIR="/usr/bin"
 CONFIG_DIR="/etc/trapd-sensor"
 STATE_DIR="/var/lib/trapd-sensor"
@@ -119,6 +153,10 @@ usage() {
 Usage: install.sh [options]
 
 Options:
+  --edition <EDITION> homelab or enterprise. Runs 'trapd-sensorctl setup'
+                       after installing: guided for homelab, flag-driven for
+                       enterprise. Omit it to install without a setup step
+                       (pre-edition behaviour).
   --token <TOKEN>     Enrollment token. Avoid this and TRAPD_ENROLL_TOKEN on
                        a shared/interactive shell — both land in history if
                        typed at a live prompt. Prefer the interactive hidden
@@ -130,11 +168,31 @@ Options:
                        (replaces /var/lib/trapd-sensor/identity.json).
   --skip-enroll       Install everything but do not enroll or start the
                        service, even if a token is available.
+  --non-interactive   Never ask anything: no token prompt, no setup questions.
+                       The token must come from --token/TRAPD_ENROLL_TOKEN.
   -h, --help          Show this help.
+
+Network setup (passed through to 'trapd-sensorctl setup'; all optional):
+  --profile <NAME>    fritzbox, unifi, opnsense, pfsense, openwrt, span,
+                       generic or manual.
+  --vantage <NAME>    lan_host, mirror_port, network_tap or gateway.
+  --interface <NAME>  Capture interface. Repeatable. Default: automatic.
+  --probe-gateway     Identify the gateway with one unauthenticated HTTP
+                       request (no credentials). Off unless asked for.
 
 Environment variables:
   TRAPD_ENROLL_TOKEN   Same as --token.
   TRAPD_SENSOR_VERSION Same as --version.
+  TRAPD_EDITION        Same as --edition.
+
+Examples:
+  # Homelab, guided setup after installation
+  curl -fsSL <url>/install.sh | sudo bash -s -- --edition homelab
+
+  # Enterprise, unattended, sensor on a switch mirror port
+  sudo TRAPD_ENROLL_TOKEN="$(cat token-file)" bash install.sh \
+    --edition enterprise --non-interactive \
+    --profile span --vantage mirror_port --interface eth1
 EOF
 }
 
@@ -144,10 +202,28 @@ while [[ $# -gt 0 ]]; do
     --version) VERSION="${2:?--version requires a value}"; shift 2 ;;
     --force-enroll) FORCE_ENROLL=1; shift ;;
     --skip-enroll) SKIP_ENROLL=1; shift ;;
+    --edition) EDITION="${2:?--edition requires a value}"; shift 2 ;;
+    --profile) SETUP_PROFILE="${2:?--profile requires a value}"; shift 2 ;;
+    --vantage) SETUP_VANTAGE="${2:?--vantage requires a value}"; shift 2 ;;
+    --interface) SETUP_INTERFACES+=("${2:?--interface requires a value}"); shift 2 ;;
+    --probe-gateway) PROBE_GATEWAY=1; shift ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
+
+case "$EDITION" in
+  ""|homelab|enterprise) ;;
+  *) die "unknown edition: $EDITION (expected 'homelab' or 'enterprise')" ;;
+esac
+
+# The setup flags only mean something with an edition; silently ignoring them
+# would leave an operator believing a mirror-port deployment was recorded.
+if [[ -z "$EDITION" ]] \
+  && { [[ -n "$SETUP_PROFILE" ]] || [[ -n "$SETUP_VANTAGE" ]] || [[ ${#SETUP_INTERFACES[@]} -gt 0 ]] || [[ "$PROBE_GATEWAY" -eq 1 ]]; }; then
+  die "--profile/--vantage/--interface/--probe-gateway need --edition (they configure the setup step, which only runs when an edition is selected)."
+fi
 
 # --- Preflight ---------------------------------------------------------
 
@@ -264,6 +340,36 @@ else
 fi
 install -m 0644 -o root -g root "$WORKDIR/packaging/config.example.toml" "${CONFIG_DIR}/config.toml.example"
 
+# --- Network setup (edition) ---------------------------------------------
+#
+# Runs before enrollment on purpose: the enroll request reports the capture
+# interfaces and the operating mode, so the backend should see the answers
+# from this step rather than the pre-setup defaults.
+#
+# It writes only the [deployment] block and the capture interface/promiscuous
+# settings — never sensor.mode and never anything under [active]. Active
+# discovery keeps needing its three separate, hand-set approvals.
+if [[ -n "$EDITION" ]]; then
+  log "running network setup (--edition ${EDITION})"
+  SETUP_ARGS=(setup --edition "$EDITION")
+  [[ -n "$SETUP_PROFILE" ]] && SETUP_ARGS+=(--profile "$SETUP_PROFILE")
+  [[ -n "$SETUP_VANTAGE" ]] && SETUP_ARGS+=(--vantage "$SETUP_VANTAGE")
+  if [[ ${#SETUP_INTERFACES[@]} -gt 0 ]]; then
+    for iface in "${SETUP_INTERFACES[@]}"; do
+      SETUP_ARGS+=(--interface "$iface")
+    done
+  fi
+  [[ "$PROBE_GATEWAY" -eq 1 ]] && SETUP_ARGS+=(--probe-gateway)
+  [[ "$NON_INTERACTIVE" -eq 1 ]] && SETUP_ARGS+=(--non-interactive)
+
+  # Runs as root: /etc/trapd-sensor/config.toml is 0640 root:trapd-sensor, so
+  # the service user cannot write it. Setup asks its questions on /dev/tty,
+  # which works even though this script itself arrived through a pipe.
+  if ! "${BIN_DIR}/trapd-sensorctl" "${SETUP_ARGS[@]}"; then
+    warn "network setup did not complete — the sensor is installed and uses the defaults from ${CONFIG_DIR}/config.toml. Re-run it any time with 'sudo trapd-sensorctl setup'."
+  fi
+fi
+
 # state_dir is configurable; the packaged systemd unit only grants write
 # access to the default via ReadWritePaths=, but an operator's config.toml
 # could still name a different (writable) path, and enrollment/start
@@ -286,7 +392,9 @@ if [[ "$SKIP_ENROLL" -eq 1 ]]; then
 elif [[ "$ALREADY_ENROLLED" -eq 1 && "$FORCE_ENROLL" -eq 0 ]]; then
   log "sensor is already enrolled (${STATE_DIR}/identity.json exists) — leaving identity as-is. Pass --force-enroll to replace it."
 else
-  if [[ -z "$TOKEN" ]]; then
+  if [[ -z "$TOKEN" && "$NON_INTERACTIVE" -eq 1 ]]; then
+    warn "no enrollment token and --non-interactive was given — skipping enrollment. Supply one via --token or TRAPD_ENROLL_TOKEN and re-run."
+  elif [[ -z "$TOKEN" ]]; then
     # -r only checks the permission bit; the open itself can still fail
     # (no controlling terminal — piped-and-backgrounded, CI, containers
     # without a tty). Both the prompt and the read must be probed as an
@@ -344,5 +452,17 @@ echo
 log "running diagnostics"
 as_sensor "${BIN_DIR}/trapd-sensorctl" diagnose || true
 
+# The payoff of the setup step: what this sensor can and cannot see here,
+# with a reason for every line. Only shown when an edition was selected —
+# an install without --edition behaves exactly as before.
+if [[ -n "$EDITION" ]]; then
+  echo
+  log "network visibility"
+  as_sensor "${BIN_DIR}/trapd-sensorctl" visibility || true
+fi
+
 echo
 log "done. 'systemctl status trapd-sensor' and 'journalctl -u trapd-sensor -f' for logs."
+if [[ -n "$EDITION" ]]; then
+  echo "     'trapd-sensorctl visibility' shows what the sensor can see; 'sudo trapd-sensorctl setup' changes it."
+fi

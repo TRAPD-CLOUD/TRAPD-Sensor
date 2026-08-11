@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::deployment::DeploymentConfig;
 use crate::error::{Result, SensorError};
 
 /// Default-Pfad der Konfigurationsdatei.
@@ -75,6 +76,10 @@ impl SensorMode {
 #[serde(default, deny_unknown_fields)]
 pub struct SensorConfig {
     pub sensor: SensorIdentityConfig,
+    /// Wie und wo dieser Sensor im Netz hängt. Fehlt der Abschnitt, gelten die
+    /// konservativen Vorgaben (siehe [`DeploymentConfig`]) — bestehende
+    /// Konfigurationen bleiben dadurch unverändert gültig.
+    pub deployment: DeploymentConfig,
     pub backend: BackendConfig,
     pub capture: CaptureConfig,
     pub passive: PassiveDiscoveryConfig,
@@ -396,6 +401,7 @@ impl SensorConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.deployment.validate().map_err(SensorError::Config)?;
         if self.backend.api_url.trim().is_empty() {
             return Err(SensorError::Config(
                 "backend.api_url must not be empty".into(),
@@ -465,6 +471,11 @@ impl SensorConfig {
     /// tatsächlich ausführen darf.
     pub fn effective_policy(&self) -> EffectivePolicy {
         EffectivePolicy::derive(self)
+    }
+
+    /// Was der Sensor an diesem Anschluss überhaupt sehen kann.
+    pub fn visibility(&self) -> crate::visibility::VisibilityReport {
+        crate::visibility::VisibilityReport::derive(self)
     }
 }
 

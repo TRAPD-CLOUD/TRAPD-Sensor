@@ -11,10 +11,12 @@
 
 pub mod error;
 pub mod interface;
+pub mod route;
 pub mod source;
 
 pub use error::{CaptureError, Result};
 pub use interface::{list_interfaces, select_interfaces, Interface};
+pub use route::{detect_vantage_point, NetworkVantagePoint};
 pub use source::{AfPacketSource, CaptureStats, NullSource, PacketSource};
 
 /// Empfehlung für `capture.snaplen`: Ethernet-, VLAN-, IP- und Transportheader

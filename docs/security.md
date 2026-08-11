@@ -8,6 +8,17 @@
   by their Rust type and are never exposed as metric labels or diagnostics.
 - Remote configuration cannot raise the local mode cap or set
   `active.acknowledged`. `passive_only` therefore remains passive.
+- The installation edition (`deployment.edition`) is descriptive, not a
+  permission: enterprise installs are allowed exactly what homelab installs
+  are. `trapd-sensorctl setup` writes only `[deployment]`,
+  `capture.interfaces` and `capture.promiscuous`, and never `sensor.mode`,
+  `active.enabled`, `active.acknowledged` or `active.targets` — it cannot make
+  a sensor send packets it would not have sent before.
+- Setup's optional gateway identification is operator-invoked, requires an
+  explicit confirmation (or `--probe-gateway`), targets only the host's own
+  default gateway, sends no credentials, and never logs response bodies.
+  Device-supplied strings are sanitized like service banners before display.
+  The daemon performs no such requests.
 - SNMP is v2c GET-only, uses only configured communities, and never performs
   SET, WALK, or credential guessing.
 - Packet and BER parsers enforce size, depth, and collection bounds. The sensor

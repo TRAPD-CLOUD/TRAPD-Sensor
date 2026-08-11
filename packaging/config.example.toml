@@ -28,6 +28,43 @@ mode = "balanced"
 
 state_dir = "/var/lib/trapd-sensor"
 
+[deployment]
+# Wie und wo dieser Sensor im Netz haengt. Ueblicherweise von
+# `trapd-sensorctl setup` geschrieben (auch nachtraeglich beliebig oft
+# wiederholbar), von Hand aenderbar. Der Abschnitt darf ganz fehlen — dann
+# gelten die Vorgaben unten.
+#
+# WICHTIG: Diese Angaben beschreiben nur, was der Sensor sehen KANN. Sie
+# erweitern seine Rechte nicht. Die Obergrenze bleibt `sensor.mode`, und
+# aktive Erkennung braucht weiterhin die drei Freigaben unter [active].
+
+# Installationsvariante:
+#   homelab     Gefuehrte Einrichtung fuer Heimnetze. Setzt keinen Managed
+#               Switch und keinen Mirror-Port voraus.
+#   enterprise  Klassisches Sensor-Deployment (SPAN/TAP, benannte Interfaces),
+#               vollstaendig automatisierbar. Vorgabe.
+edition = "enterprise"
+
+# Welche Plattform das Netz verwaltet:
+#   fritzbox, unifi, opnsense, pfsense, openwrt, span, generic, manual
+# Steuert die Hinweise im Setup und in `trapd-sensorctl visibility`.
+profile = "manual"
+
+# Der Beobachtungspunkt — die technisch entscheidende Angabe:
+#   lan_host     Wie ein normales Geraet am LAN. Broadcast/Multicast (ARP,
+#                NDP, DHCP, mDNS, SSDP) plus eigener Verkehr. Vorgabe.
+#   mirror_port  SPAN-/Mirror-Port eines Managed Switch.
+#   network_tap  Passiver Netzwerk-TAP.
+#   gateway      Der Sensor sieht den gerouteten Verkehr.
+#
+# mirror_port und network_tap brauchen `capture.promiscuous = true`.
+#
+# Optional ergaenzt `trapd-sensorctl setup` hier noch die erkannten Werte
+# `gateway_ip` (z. B. "192.168.178.1") und `lan_cidr` (z. B.
+# "192.168.178.0/24"). Beide sind rein informativ — der Sensor verbindet sich
+# nicht von sich aus zum Gateway.
+vantage = "lan_host"
+
 [backend]
 api_url = "https://api.trapd.io"
 ingest_url = "https://ingest.trapd.io"
