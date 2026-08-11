@@ -20,6 +20,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features --locked
       - run: cargo test --workspace --no-default-features --locked
+      - name: Pin cargo-audit to a version compatible with rustc 1.86
+        # cargo-audit 0.22.2+ requires rustc 1.88; audit-check installs
+        # "latest" if cargo-audit isn't already on PATH, so pre-install a
+        # version that still supports our pinned toolchain.
+        run: cargo install cargo-audit --version 0.22.1 --locked
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
