@@ -599,10 +599,14 @@ async fn run_fritzbox_session(
             let take = (64 - preview.len()).min(chunk.len());
             preview.extend_from_slice(&chunk[..take]);
         }
+        let push_result = decoder.push(&chunk);
+        // After push, not before: a single chunk can carry the global header
+        // and the first packet together, in which case the header only
+        // becomes known as a side effect of this push call.
         if !header_logged {
             header_logged = trapd_sensor_capture::fritzbox::log_pcap_format_if_known(&decoder);
         }
-        let packets = match decoder.push(&chunk) {
+        let packets = match push_result {
             Ok(packets) => packets,
             Err(error) => {
                 context.state.update_fritzbox(|h| h.parser_error_count += 1);
