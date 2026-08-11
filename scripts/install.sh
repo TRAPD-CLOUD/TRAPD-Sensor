@@ -138,31 +138,30 @@ fetch() {
     || die "could not download ${name} from ${BASE_URL} — check the version/network, or see README.md for a from-source install."
 }
 
-log "downloading trapd-sensord and trapd-sensorctl (${TARGET})"
+log "downloading trapd-sensord, trapd-sensorctl and packaging files (${TARGET})"
 fetch "trapd-sensord-${TARGET}" "$WORKDIR/trapd-sensord"
 fetch "trapd-sensorctl-${TARGET}" "$WORKDIR/trapd-sensorctl"
+fetch "packaging.tar.gz" "$WORKDIR/packaging.tar.gz"
 fetch "SHA256SUMS" "$WORKDIR/SHA256SUMS"
 
 log "verifying checksums"
 (
   cd "$WORKDIR"
   awk -v a="trapd-sensord-${TARGET}" -v b="trapd-sensorctl-${TARGET}" \
-    '$2==a || $2==b {print}' SHA256SUMS > expected.sums
-  [[ -s expected.sums ]] || exit 2
+    '$2==a || $2==b || $2=="packaging.tar.gz" {print}' SHA256SUMS > expected.sums
+  [[ $(wc -l < expected.sums) -eq 3 ]] || exit 2
   sed -e "s/trapd-sensord-${TARGET}/trapd-sensord/" -e "s/trapd-sensorctl-${TARGET}/trapd-sensorctl/" expected.sums > renamed.sums
   sha256sum --check --strict renamed.sums >&2
 ) || {
   status=$?
   if [[ $status -eq 2 ]]; then
-    die "SHA256SUMS did not list the downloaded binaries — refusing to install unverified files."
+    die "SHA256SUMS did not list all three downloaded files (binaries + packaging.tar.gz) — refusing to install unverified files."
   else
     die "checksum verification failed — downloaded files do not match SHA256SUMS. Not installing."
   fi
 }
 chmod 0755 "$WORKDIR/trapd-sensord" "$WORKDIR/trapd-sensorctl"
 
-log "downloading packaging files (systemd unit, sysusers, tmpfiles, example config)"
-fetch "packaging.tar.gz" "$WORKDIR/packaging.tar.gz"
 tar -xzf "$WORKDIR/packaging.tar.gz" -C "$WORKDIR"
 [[ -f "$WORKDIR/packaging/systemd/trapd-sensor.service" ]] \
   || die "packaging.tar.gz did not contain the expected files — release asset looks corrupt."
@@ -197,12 +196,31 @@ else
 fi
 
 if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
-  log "installing default config to ${CONFIG_DIR}/config.toml (edit before enrolling in sensitive networks)"
+  log "installing default config to ${CONFIG_DIR}/config.toml"
   install -m 0640 -g trapd-sensor "$WORKDIR/packaging/config.example.toml" "${CONFIG_DIR}/config.toml"
+  # The example's name/site are sample values ("homelab-sensor-01"/"Keller"),
+  # not placeholders trapd-sensorctl replaces on its own — left as-is, every
+  # quickstart install would enroll under the same display name. Give each
+  # host a distinct default (its hostname, no site) and say so; still worth
+  # a look before enrolling on a sensitive network.
+  hn="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo trapd-sensor)"
+  sed -i \
+    -e "s/^name = \"homelab-sensor-01\"/name = \"${hn}\"/" \
+    -e '/^site = "Keller"/d' \
+    "${CONFIG_DIR}/config.toml"
+  log "  name defaulted to this host's hostname (${hn}); review ${CONFIG_DIR}/config.toml before enrolling on a sensitive network"
 else
   log "existing ${CONFIG_DIR}/config.toml left untouched"
 fi
 install -m 0644 -o root -g root "$WORKDIR/packaging/config.example.toml" "${CONFIG_DIR}/config.toml.example"
+
+# state_dir is configurable; the packaged systemd unit only grants write
+# access to the default via ReadWritePaths=, but an operator's config.toml
+# could still name a different (writable) path, and enrollment/start
+# decisions below must agree with where trapd-sensorctl actually put the
+# identity file.
+configured_state_dir="$(sed -n 's/^state_dir *= *"\(.*\)"/\1/p' "${CONFIG_DIR}/config.toml" | head -1)"
+[[ -n "$configured_state_dir" ]] && STATE_DIR="$configured_state_dir"
 
 # --- Enroll --------------------------------------------------------------
 
@@ -242,7 +260,7 @@ unset TOKEN
 
 # --- Start + verify -------------------------------------------------------
 
-if [[ -f "${STATE_DIR}/identity.json" ]]; then
+if [[ "$SKIP_ENROLL" -eq 0 && -f "${STATE_DIR}/identity.json" ]]; then
   if [[ "$RESTART_AFTER" -eq 1 ]]; then
     log "restarting trapd-sensor (was already running — upgrading in place)"
     systemctl restart trapd-sensor
@@ -253,6 +271,11 @@ if [[ -f "${STATE_DIR}/identity.json" ]]; then
   sleep 1
   echo
   sudo -u trapd-sensor "${BIN_DIR}/trapd-sensorctl" status || warn "status check failed — the service may still be starting; try 'trapd-sensorctl status' again in a few seconds."
+elif [[ "$SKIP_ENROLL" -eq 1 ]]; then
+  log "not starting the service (--skip-enroll)."
+  echo "Enroll and start it with:"
+  echo "  sudo -u trapd-sensor trapd-sensorctl enroll --token <TOKEN>"
+  echo "  sudo systemctl enable --now trapd-sensor"
 else
   log "not starting the service — the sensor is installed but not enrolled yet."
   echo "Enroll and start it with:"
