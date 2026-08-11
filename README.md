@@ -1,5 +1,9 @@
 # TRAPD Network Sensor
 
+> FRITZ!Box users: the deployment profile and remote capture opt-in are distinct.
+> See [FRITZ!Box live capture](docs/fritzbox.md) for security, compatibility, and
+> current runtime limitations.
+
 Ein eigenständiger, ressourcenschonender Netzwerksensor für Homelabs und
 Unternehmensnetze. Er erkennt Geräte, Dienste und Netzbeziehungen, normalisiert
 das Ergebnis und schickt es an das TRAPD-Backend. Der Sensor selbst enthält

@@ -86,6 +86,19 @@ snaplen = 512
 flow_window_secs = 60
 max_tracked_flows = 50000
 
+# The deployment profile and live capture are independent. Existing FRITZ!Box
+# installations remain local-only unless this block is explicitly enabled.
+[capture.fritzbox]
+enabled = false
+address = "fritz.box"
+# Opaque IDs discovered from this router; never copy IDs from another model.
+interfaces = []
+# Username/password live in this separate 0600 file, not in config or remote config.
+credentials_file = "/var/lib/trapd-sensor/secrets/fritzbox.toml"
+connect_timeout_secs = 10
+read_timeout_secs = 30
+max_packet_bytes = 65535
+
 [passive]
 arp = true
 dhcp = true

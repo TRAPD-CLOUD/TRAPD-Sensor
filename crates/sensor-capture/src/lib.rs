@@ -10,6 +10,7 @@
 //! vergeben — der Sensor läuft nicht als root.
 
 pub mod error;
+pub mod fritzbox;
 pub mod interface;
 pub mod route;
 pub mod source;
