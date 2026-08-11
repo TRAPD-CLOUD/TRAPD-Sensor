@@ -437,7 +437,10 @@ async fn validate_capture(
     // Metadata only (status/content-type/content-length/redacted URL) — safe
     // to keep around and include directly in the error shown to the operator.
     let response_diagnostic = trapd_sensor_capture::fritzbox::describe_capture_response(&response);
-    tracing::debug!(response = %response_diagnostic, "FRITZ!Box capture response received");
+    // `target` pinned to the capture crate so `RUST_LOG=trapd_sensor_capture=debug`
+    // (the documented way to see capture diagnostics) enables this line too,
+    // even though it is logged from the CLI crate.
+    tracing::debug!(target: "trapd_sensor_capture", response = %response_diagnostic, "FRITZ!Box capture response received");
 
     let mut decoder = trapd_sensor_capture::fritzbox::PcapStreamDecoder::new(max_packet);
     // Only the first bytes of the stream, and only until the decoder proves the
@@ -465,6 +468,7 @@ async fn validate_capture(
             Ok(_) => {}
             Err(error) => {
                 tracing::debug!(
+                    target: "trapd_sensor_capture",
                     preview = %trapd_sensor_capture::fritzbox::preview_stream_bytes(&preview),
                     "FRITZ!Box capture stream did not decode as PCAP"
                 );
