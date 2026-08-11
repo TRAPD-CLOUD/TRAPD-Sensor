@@ -88,10 +88,84 @@ pub async fn run(config_path: &Path, config: &SensorConfig) -> Report {
     check_service(&mut report, config);
     check_capabilities(&mut report, config);
     check_network(&mut report, config);
+    check_fritzbox(&mut report, config).await;
     check_storage(&mut report, config);
     check_backend(&mut report, config).await;
     check_runtime(&mut report, config).await;
     report
+}
+
+async fn check_fritzbox(report: &mut Report, config: &SensorConfig) {
+    let fb = &config.capture.fritzbox;
+    if !fb.enabled {
+        report.push("capture.fritzbox", CheckStatus::Ok, "disabled (optional)");
+        return;
+    }
+    match trapd_sensor_capture::fritzbox::SecretStore::new(&fb.credentials_file).load() {
+        Err(error) => {
+            report.push(
+                "capture.fritzbox.credentials",
+                CheckStatus::Error,
+                error.to_string(),
+            );
+        }
+        Ok(credentials) => match trapd_sensor_capture::fritzbox::FritzBoxClient::new(
+            &fb.address,
+            std::time::Duration::from_secs(fb.connect_timeout_secs),
+            std::time::Duration::from_secs(fb.read_timeout_secs),
+        ) {
+            Err(error) => report.push(
+                "capture.fritzbox.address",
+                CheckStatus::Error,
+                error.to_string(),
+            ),
+            Ok(client) => match client.authenticate(&credentials).await {
+                Err(_) => report.push(
+                    "capture.fritzbox.authentication",
+                    CheckStatus::Error,
+                    "authentication failed",
+                ),
+                Ok(session) => match session.capture_interfaces().await {
+                    Err(_) => report.push(
+                        "capture.fritzbox.interfaces",
+                        CheckStatus::Error,
+                        "interface discovery failed",
+                    ),
+                    Ok(found) => {
+                        let missing: Vec<_> = fb
+                            .interfaces
+                            .iter()
+                            .filter(|id| {
+                                !found
+                                    .iter()
+                                    .any(|item| item.id.as_str() == id.as_str() && item.available)
+                            })
+                            .cloned()
+                            .collect();
+                        if missing.is_empty() {
+                            report.push(
+                                "capture.fritzbox.interfaces",
+                                CheckStatus::Ok,
+                                format!(
+                                    "{} configured interface(s) advertised",
+                                    fb.interfaces.len()
+                                ),
+                            );
+                        } else {
+                            report.push(
+                                "capture.fritzbox.interfaces",
+                                CheckStatus::Error,
+                                format!(
+                                    "configured interfaces unavailable: {}",
+                                    missing.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                },
+            },
+        },
+    }
 }
 
 fn check_config(report: &mut Report, path: &Path, config: &SensorConfig) {

@@ -394,6 +394,14 @@ impl VisibilityReport {
             }
         });
 
+        capabilities.push(if config.capture.fritzbox.enabled {
+            Capability { id: "fritzbox_remote_capture", label: "FRITZ!Box Remote Capture", level: VisibilityLevel::Partial,
+                reason: "remote capture is configured; live provider health and selected router sources determine the traffic actually visible (source labels are not treated as capabilities)".into() }
+        } else {
+            Capability { id: "fritzbox_remote_capture", label: "FRITZ!Box Remote Capture", level: VisibilityLevel::None,
+                reason: "the optional FRITZ!Box remote capture provider is disabled".into() }
+        });
+
         // --- Notes ----------------------------------------------------------------
         let mut notes = Vec::new();
         if !deployment.is_configured() {

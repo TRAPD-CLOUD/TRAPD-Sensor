@@ -174,6 +174,39 @@ pub struct CaptureConfig {
     pub flow_window_secs: u64,
     /// Obergrenze gleichzeitig verfolgter Flows (Cardinality-Schutz).
     pub max_tracked_flows: usize,
+    /// Optional vendor-isolated remote capture. It is never enabled merely by
+    /// selecting the FRITZ!Box deployment profile.
+    pub fritzbox: FritzBoxCaptureConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FritzBoxCaptureConfig {
+    pub enabled: bool,
+    pub address: String,
+    /// Router-defined capture identifiers; deliberately plural for future
+    /// concurrent capture (currently providers supervise each independently).
+    pub interfaces: Vec<String>,
+    /// Path to a root/service-user readable secret, separate from ordinary and
+    /// remotely replaceable configuration.
+    pub credentials_file: PathBuf,
+    pub connect_timeout_secs: u64,
+    pub read_timeout_secs: u64,
+    pub max_packet_bytes: usize,
+}
+
+impl Default for FritzBoxCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: "fritz.box".into(),
+            interfaces: Vec::new(),
+            credentials_file: PathBuf::from("/var/lib/trapd-sensor/secrets/fritzbox.toml"),
+            connect_timeout_secs: 10,
+            read_timeout_secs: 30,
+            max_packet_bytes: 65_535,
+        }
+    }
 }
 
 impl Default for CaptureConfig {
@@ -184,6 +217,7 @@ impl Default for CaptureConfig {
             snaplen: 512,
             flow_window_secs: 60,
             max_tracked_flows: 50_000,
+            fritzbox: FritzBoxCaptureConfig::default(),
         }
     }
 }
@@ -443,6 +477,26 @@ impl SensorConfig {
         }
         if self.capture.snaplen < 64 {
             return Err(SensorError::Config("capture.snaplen must be >= 64".into()));
+        }
+        if self.capture.fritzbox.enabled {
+            if self.capture.fritzbox.interfaces.is_empty() {
+                return Err(SensorError::Config(
+                    "capture.fritzbox.interfaces must not be empty when enabled".into(),
+                ));
+            }
+            if self.capture.fritzbox.address.trim().is_empty()
+                || self.capture.fritzbox.connect_timeout_secs == 0
+                || self.capture.fritzbox.read_timeout_secs == 0
+            {
+                return Err(SensorError::Config(
+                    "FRITZ!Box address and timeouts must be non-empty/non-zero".into(),
+                ));
+            }
+            if !(64..=1_048_576).contains(&self.capture.fritzbox.max_packet_bytes) {
+                return Err(SensorError::Config(
+                    "capture.fritzbox.max_packet_bytes must be between 64 and 1048576".into(),
+                ));
+            }
         }
         if self.active.enabled && self.active.rate_limit_per_sec == 0 {
             return Err(SensorError::Config(

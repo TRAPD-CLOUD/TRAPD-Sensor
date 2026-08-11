@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     config.validate()?;
 
     if cli.check {
+        validate_capture_providers(&config)?;
         report_configuration(&config);
         return Ok(());
     }
@@ -101,6 +102,19 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+fn validate_capture_providers(config: &SensorConfig) -> anyhow::Result<()> {
+    let fb = &config.capture.fritzbox;
+    if fb.enabled {
+        trapd_sensor_capture::fritzbox::FritzBoxClient::new(
+            &fb.address,
+            std::time::Duration::from_secs(fb.connect_timeout_secs),
+            std::time::Duration::from_secs(fb.read_timeout_secs),
+        )?;
+        trapd_sensor_capture::fritzbox::SecretStore::new(&fb.credentials_file).load()?;
+    }
+    Ok(())
+}
+
 /// Gibt aus, was der Sensor mit dieser Konfiguration tatsächlich täte.
 ///
 /// `--check` beantwortet die Frage, die sonst erst der Betrieb beantwortet:
@@ -128,6 +142,14 @@ fn report_configuration(config: &SensorConfig) {
             "(none found)".to_string()
         } else {
             interfaces.join(", ")
+        }
+    );
+    println!(
+        "  FRITZ!Box capture: {}",
+        if config.capture.fritzbox.enabled {
+            "enabled"
+        } else {
+            "disabled"
         }
     );
 

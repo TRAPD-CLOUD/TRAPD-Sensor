@@ -23,6 +23,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use trapd_sensor_active::Scanner;
 use trapd_sensor_buffer::EventQueue;
+use trapd_sensor_capture::fritzbox::{retry_delay, FritzBoxClient, PcapStreamDecoder, SecretStore};
 use trapd_sensor_capture::{AfPacketSource, PacketSource};
 use trapd_sensor_core::config::SensorConfig;
 use trapd_sensor_core::identity::SensorIdentity;
@@ -142,8 +143,14 @@ impl Daemon {
 
         // --- Capture je Interface ---
         let interfaces = trapd_sensor_capture::select_interfaces(&self.config.capture.interfaces);
-        self.state
-            .set_interfaces_configured(interfaces.len() as u64);
+        self.state.set_interfaces_configured(
+            (interfaces.len()
+                + if self.config.capture.fritzbox.enabled {
+                    self.config.capture.fritzbox.interfaces.len()
+                } else {
+                    0
+                }) as u64,
+        );
         if interfaces.is_empty() {
             tracing::error!(
                 "no capture interface available — the sensor will not observe anything"
@@ -198,10 +205,30 @@ impl Daemon {
             }
         }
         self.state.set_interfaces_up(opened);
-        if opened == 0 {
+        if opened == 0 && !self.config.capture.fritzbox.enabled {
             self.state
                 .mark_unhealthy("no capture interface could be opened");
             return Err(anyhow::anyhow!("no capture interface could be opened"));
+        }
+
+        // Remote providers are recoverable producers: each configured router
+        // interface supervises itself and never participates in the critical
+        // task select below.
+        let mut fritzbox_handles = tokio::task::JoinSet::new();
+        if self.config.capture.fritzbox.enabled {
+            let fb = self.config.capture.fritzbox.clone();
+            self.state
+                .init_fritzbox(fb.address.clone(), fb.interfaces.clone());
+            for interface in fb.interfaces.clone() {
+                fritzbox_handles.spawn(run_fritzbox_capture(
+                    interface,
+                    fb.clone(),
+                    policy.clone(),
+                    obs_tx.clone(),
+                    self.state.clone(),
+                    producer_shutdown.clone(),
+                ));
+            }
         }
 
         // --- Heartbeat ---
@@ -278,6 +305,11 @@ impl Daemon {
             while let Some(result) = capture_handles.join_next().await {
                 if let Err(error) = result {
                     tracing::error!(%error, "capture task join failed during shutdown");
+                }
+            }
+            while let Some(result) = fritzbox_handles.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "FRITZ!Box capture task join failed during shutdown");
                 }
             }
             let _ = heartbeat.await;
@@ -430,6 +462,143 @@ async fn run_capture(
     })
     .await??;
     Ok(())
+}
+
+async fn run_fritzbox_capture(
+    interface_id: String,
+    config: trapd_sensor_core::config::FritzBoxCaptureConfig,
+    policy: trapd_sensor_core::config::EffectivePolicy,
+    obs_tx: mpsc::Sender<Observation>,
+    state: Arc<SensorState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        state.update_fritzbox(|h| {
+            h.state = "authenticating".into();
+            h.last_error_code = None;
+        });
+        let result = run_fritzbox_session(
+            &interface_id,
+            &config,
+            &policy,
+            &obs_tx,
+            &state,
+            &mut shutdown,
+        )
+        .await;
+        let auth_failure = matches!(&result, Err(code) if code == "authentication_failed" || code == "credentials_unavailable");
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let delay = retry_delay(attempt, auth_failure);
+        attempt = attempt.saturating_add(1);
+        state.update_fritzbox(|h| {
+            if h.active_interfaces.is_empty() {
+                h.state = "backoff".into();
+            }
+            h.current_backoff_secs = delay.as_secs();
+            h.reconnect_count += 1;
+            h.last_error_code = result.err();
+        });
+        tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = shutdown.changed() => if *shutdown.borrow() { return Ok(()); } }
+    }
+}
+
+async fn run_fritzbox_session(
+    interface_id: &str,
+    config: &trapd_sensor_core::config::FritzBoxCaptureConfig,
+    policy: &trapd_sensor_core::config::EffectivePolicy,
+    obs_tx: &mpsc::Sender<Observation>,
+    state: &Arc<SensorState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let credentials = SecretStore::new(&config.credentials_file)
+        .load()
+        .map_err(|_| "credentials_unavailable".to_string())?;
+    let client = FritzBoxClient::new(
+        &config.address,
+        Duration::from_secs(config.connect_timeout_secs),
+        Duration::from_secs(config.read_timeout_secs),
+    )
+    .map_err(|_| "invalid_address".to_string())?;
+    let session = client.authenticate(&credentials).await.map_err(|error| {
+        state.update_fritzbox(|h| h.auth_failure_count += 1);
+        tracing::warn!(interface = interface_id, error = %error, "FRITZ!Box authentication failed");
+        "authentication_failed".to_string()
+    })?;
+    state.update_fritzbox(|h| {
+        h.authenticated = true;
+        h.last_successful_auth = Some(chrono::Utc::now().to_rfc3339());
+        h.state = "discovering".into();
+    });
+    let interfaces = session
+        .capture_interfaces()
+        .await
+        .map_err(|_| "interface_discovery_failed".to_string())?;
+    let interface = interfaces
+        .into_iter()
+        .find(|candidate| candidate.id == interface_id && candidate.available)
+        .ok_or_else(|| "configured_interface_unavailable".to_string())?;
+    state.update_fritzbox(|h| h.state = "connecting".into());
+    let mut response = session
+        .start_capture(&interface)
+        .await
+        .map_err(|_| "capture_endpoint_failed".to_string())?;
+    let mut decoder = PcapStreamDecoder::new(config.max_packet_bytes);
+    let mut observer = PassiveObserver::new(
+        format!("fritzbox:{interface_id}"),
+        policy.clone(),
+        60,
+        50_000,
+    );
+    let mut active = false;
+    loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => result.map_err(|_| "stream_error".to_string())?,
+            _ = shutdown.changed() => { if *shutdown.borrow() { if active { state.fritzbox_interface_down(interface_id); } return Ok(()); } continue; }
+        };
+        let Some(chunk) = chunk else {
+            if active {
+                state.fritzbox_interface_down(interface_id);
+            }
+            state.update_fritzbox(|h| h.stream_error_count += 1);
+            return Err("stream_eof".into());
+        };
+        let packets = decoder.push(&chunk).map_err(|_| {
+            state.update_fritzbox(|h| h.parser_error_count += 1);
+            "malformed_pcap".to_string()
+        })?;
+        if let Some(link_type) = decoder.link_type() {
+            if link_type != 1 {
+                return Err("unsupported_link_type".into());
+            }
+        }
+        for packet in packets {
+            if !active {
+                active = true;
+                state.fritzbox_interface_up(interface_id);
+            }
+            let bytes = packet.data.len() as u64;
+            state.add_capture_bytes(bytes);
+            state.update_fritzbox(|h| {
+                h.packets_received += 1;
+                h.bytes_received += bytes;
+                h.last_packet_at = Some(chrono::Utc::now().to_rfc3339());
+            });
+            for observation in observer.handle_frame(&packet.data, chrono::Utc::now()) {
+                if obs_tx.send(observation).await.is_err() {
+                    if active {
+                        state.fritzbox_interface_down(interface_id);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 /// Der einzige Ort, an dem aus einer Beobachtung ein Event wird.
@@ -616,5 +785,93 @@ async fn run_sweeps(
                 state.record_sweep(stats);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fritzbox_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn pcap() -> Vec<u8> {
+        let frame: [u8; 42] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1, 2, 3, 4, 5, 0x08, 0x06, 0, 1, 0x08, 0, 6, 4,
+            0, 2, 0, 1, 2, 3, 4, 5, 192, 168, 1, 2, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1,
+        ];
+        let mut bytes = vec![
+            0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        bytes.extend([1, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 42, 0, 0, 0]);
+        bytes.extend(frame);
+        bytes
+    }
+
+    async fn fixture() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body=match step {0=>"<SessionInfo><Challenge>12345678</Challenge><SID>0000000000000000</SID></SessionInfo>".as_bytes().to_vec(),1=>"<SessionInfo><SID>0123456789abcdef</SID></SessionInfo>".as_bytes().to_vec(),2=>br#"<input name="capture" value="lan"> LAN"#.to_vec(),_=>pcap()};
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                if step == 3 {
+                    for byte in body {
+                        stream.write_all(&[byte]).await.unwrap();
+                    }
+                } else {
+                    stream.write_all(&body).await.unwrap();
+                }
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn remote_pcap_enters_the_existing_passive_pipeline() {
+        let (address, server) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        SecretStore::new(&secret)
+            .save(&trapd_sensor_capture::fritzbox::Credentials {
+                username: "sensor".into(),
+                password: "secret".into(),
+            })
+            .unwrap();
+        let config = trapd_sensor_core::config::FritzBoxCaptureConfig {
+            enabled: true,
+            address,
+            interfaces: vec!["lan".into()],
+            credentials_file: secret,
+            connect_timeout_secs: 2,
+            read_timeout_secs: 2,
+            max_packet_bytes: 64,
+        };
+        let state = Arc::new(SensorState::new("test".into(), "balanced".into()));
+        state.init_fritzbox(config.address.clone(), config.interfaces.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let result = run_fritzbox_session(
+            "lan",
+            &config,
+            &trapd_sensor_core::config::SensorConfig::default().effective_policy(),
+            &tx,
+            &state,
+            &mut shutdown,
+        )
+        .await;
+        assert_eq!(result, Err("stream_eof".into()));
+        assert!(rx.recv().await.is_some());
+        let status: serde_json::Value = serde_json::from_str(&state.render_status_json()).unwrap();
+        assert_eq!(
+            status["capture_providers"]["fritzbox"]["packets_received"],
+            1
+        );
+        server.await.unwrap();
     }
 }

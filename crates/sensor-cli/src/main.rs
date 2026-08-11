@@ -397,6 +397,37 @@ async fn status(config: &SensorConfig, json: bool) -> anyhow::Result<()> {
         status["packets"]["captured"].as_u64().unwrap_or_default(),
         status["packets"]["dropped"].as_u64().unwrap_or_default(),
     );
+    if let Some(fritzbox) = status["capture_providers"]["fritzbox"].as_object() {
+        println!("\nFRITZ!Box capture");
+        println!(
+            "  status:     {}",
+            fritzbox["state"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  address:    {}",
+            fritzbox["address"].as_str().unwrap_or("?")
+        );
+        let interfaces = fritzbox["configured_interfaces"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        println!("  interfaces: {interfaces}");
+        println!(
+            "  packets:    {}",
+            fritzbox["packets_received"].as_u64().unwrap_or(0)
+        );
+        if let Some(reason) = fritzbox["last_error_code"].as_str() {
+            println!("  reason:     {reason}");
+        }
+        if let Some(retry) = fritzbox["current_backoff_secs"].as_u64().filter(|n| *n > 0) {
+            println!("  retry:      {retry}s");
+        }
+    }
     println!(
         "devices   {}",
         status["devices_tracked"].as_u64().unwrap_or_default()

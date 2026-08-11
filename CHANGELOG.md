@@ -8,6 +8,11 @@ All notable changes to TRAPD Sensor are documented here. The format follows
 
 ### Added
 
+- End-to-end supervised FRITZ!Box capture in the daemon, including fresh-session
+  reconnects, interface validation, Ethernet PCAP ingestion through the existing
+  passive observer, bounded backpressure, status/metrics/diagnose/check output,
+  and hidden-password interactive setup.
+
 - **Installation editions.** `install.sh --edition homelab|enterprise` (also
   `TRAPD_EDITION`) selects how the network setup is answered — guided for
   homelab, flag-driven for enterprise — using one installer and one setup
@@ -56,6 +61,15 @@ All notable changes to TRAPD Sensor are documented here. The format follows
   depends on.
 
 ### Fixed
+
+### Added
+
+- Vendor-isolated FRITZ!OS authentication and live-capture primitives: legacy
+  and PBKDF2 challenge responses, router-advertised interface discovery,
+  redirect-safe streaming capture, a bounded incremental classic-PCAP decoder,
+  redacted 0600 credential storage, and bounded reconnect scheduling.
+- Optional `[capture.fritzbox]` configuration. A `fritzbox` deployment profile
+  remains backwards-compatible and does not enable or require router access.
 
 - `trapd-sensorctl diagnose` checked its own (always-empty) process
   capabilities instead of the `trapd-sensord` daemon's, permanently
