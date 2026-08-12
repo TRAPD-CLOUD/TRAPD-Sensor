@@ -145,7 +145,29 @@ async fn main() -> anyhow::Result<()> {
                 }
                 std::process::exit(report.exit_code().into());
             }
-            return Err(error).with_context(|| format!("could not load {}", cli.config.display()));
+            // `setup` exists to fix a broken configuration (that is what the
+            // new backend-host prompt below is for), so it must not refuse to
+            // start just because the file it is about to fix does not
+            // currently validate. It starts from defaults instead — prompts
+            // that normally pre-fill the previous value (FRITZ!Box address,
+            // interfaces, ...) show the default instead, since the broken
+            // file couldn't be parsed to read them back. The write path
+            // (`update_document`) edits the real file's TOML in place, so
+            // everything setup does not ask about (comments, other keys)
+            // still survives regardless of this fallback.
+            if matches!(cli.command, Command::Setup { .. }) {
+                eprintln!(
+                    "warning: {} is present but invalid ({error}) — starting setup from \
+                     defaults so you can fix it. Previous answers this can't read back \
+                     (e.g. the FRITZ!Box address) will show as their defaults; re-enter them \
+                     if they need to stay the same.",
+                    cli.config.display()
+                );
+                SensorConfig::default()
+            } else {
+                return Err(error)
+                    .with_context(|| format!("could not load {}", cli.config.display()));
+            }
         }
     };
 
