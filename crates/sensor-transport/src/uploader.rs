@@ -393,6 +393,7 @@ mod tests {
         Fail(&'static str),
         Reject,
         Revoke,
+        Routing,
     }
 
     impl MockSink {
@@ -432,6 +433,10 @@ mod tests {
                     message: "invalid".into(),
                 }),
                 MockResponse::Revoke => Err(TransportError::Revoked("quarantined".into())),
+                MockResponse::Routing => Err(TransportError::Routing {
+                    status: 404,
+                    message: "not found".into(),
+                }),
             }
         }
     }
@@ -598,6 +603,27 @@ mod tests {
 
         let total: usize = received.lock().expect("lock").iter().map(|b| b.len()).sum();
         assert_eq!(total, 3, "buffered events are replayed after a restart");
+    }
+
+    #[tokio::test]
+    async fn routing_404_retries_without_committing_the_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sink, received) = MockSink::new(vec![MockResponse::Routing]);
+        let stats = Arc::new(UploaderStats::default());
+        let uploader = Uploader::new(queue(dir.path()), sink, config(), stats.clone());
+        let (tx, rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(uploader.run(rx, shutdown_rx));
+        tx.send(event(1)).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        shutdown_tx.send(true).expect("shutdown");
+        handle.await.expect("join");
+        assert!(
+            received.lock().expect("lock").len() >= 2,
+            "404 batch must be retried"
+        );
+        assert_eq!(stats.snapshot().upload_discarded, 0);
+        assert_eq!(stats.snapshot().events_uploaded, 1);
     }
 
     #[tokio::test]

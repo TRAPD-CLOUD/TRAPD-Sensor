@@ -20,6 +20,11 @@ pub enum TransportError {
     #[error("rate limited, retry after {retry_after:?}")]
     RateLimited { retry_after: Option<Duration> },
 
+    /// Routing/proxy mismatch (404/405/408/409/425). The same payload can
+    /// succeed after a rollout or failover, so the WAL must retain it.
+    #[error("backend route temporarily unavailable ({status}): {message}")]
+    Routing { status: u16, message: String },
+
     /// 401/403. Das Secret gilt nicht mehr. Weiter zu versuchen ist zwecklos
     /// und würde nur Last erzeugen — der Sensor meldet das und hält an.
     #[error("authentication rejected: {0}")]
@@ -48,7 +53,10 @@ impl TransportError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Network(_) | Self::Server { .. } | Self::RateLimited { .. }
+            Self::Network(_)
+                | Self::Server { .. }
+                | Self::RateLimited { .. }
+                | Self::Routing { .. }
         )
     }
 
@@ -71,6 +79,7 @@ impl TransportError {
             Self::Network(_) => "network",
             Self::Server { .. } => "server",
             Self::RateLimited { .. } => "rate_limited",
+            Self::Routing { .. } => "routing",
             Self::Unauthorized(_) => "unauthorized",
             Self::Revoked(_) => "revoked",
             Self::BadRequest { .. } => "bad_request",

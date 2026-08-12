@@ -226,6 +226,13 @@ pub(crate) fn classify(
         // Backend nicht mehr und stellt den Betrieb ein.
         410 => Some(TransportError::Revoked(detail)),
         429 => Some(TransportError::RateLimited { retry_after }),
+        // These statuses commonly describe a rolling-deploy/proxy/routing
+        // condition rather than malformed event bytes. Never acknowledge the
+        // WAL for them.
+        404 | 405 | 408 | 409 | 425 => Some(TransportError::Routing {
+            status,
+            message: detail,
+        }),
         400..=499 => Some(TransportError::BadRequest {
             status,
             message: detail,
@@ -307,6 +314,16 @@ mod tests {
             TransportError::BadRequest { status: 400, .. }
         ));
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn missing_or_not_yet_routed_endpoint_is_retried() {
+        for status in [404, 405, 408, 409, 425] {
+            let err = classify(status, "", None).expect("error");
+            assert!(matches!(err, TransportError::Routing { .. }));
+            assert!(err.is_retryable());
+            assert!(!err.is_terminal());
+        }
     }
 
     #[test]
