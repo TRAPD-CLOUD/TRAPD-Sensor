@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-active"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "libc",
  "rand 0.8.7",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-buffer"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "crc32fast",
  "serde",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-capture"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "libc",
  "md-5",
@@ -2005,7 +2005,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-cli"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-core"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "chrono",
  "libc",
@@ -2037,11 +2037,12 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "trapd-sensor-daemon"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2063,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-fingerprint"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "tempfile",
  "tracing",
@@ -2072,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-passive"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "chrono",
  "serde",
@@ -2082,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-sensor-transport"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "chrono",
  "rand 0.8.7",

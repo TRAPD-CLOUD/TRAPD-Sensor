@@ -137,6 +137,15 @@ pub struct UploaderConfig {
     pub sensor_version: String,
     pub batch_max_events: usize,
     pub flush_interval: Duration,
+    /// Wie oft die WAL-Segmente unabhängig vom Upload-Zyklus gefsynct werden.
+    ///
+    /// Getrennt von `flush_interval`: der Upload-Timer wird bewusst großzügig
+    /// bemessen (Batching-Effizienz), aber ein langes Intervall dort darf
+    /// nicht das Absturzfenster für ungesicherte Appends bestimmen. Ein
+    /// eigener, kurzer Timer hält dieses Fenster klein, ohne bei jedem
+    /// einzelnen `append()` einen fsync auszulösen (der bei den Paketraten
+    /// dieses Sensors zu teuer wäre).
+    pub wal_flush_interval: Duration,
     pub backoff: BackoffConfig,
 }
 
@@ -145,12 +154,14 @@ impl UploaderConfig {
         identity: &SensorIdentity,
         batch_max_events: usize,
         flush_interval: Duration,
+        wal_flush_interval: Duration,
     ) -> Self {
         Self {
             sensor_id: identity.sensor_id.clone(),
             sensor_version: trapd_sensor_core::VERSION.to_string(),
             batch_max_events: batch_max_events.max(1),
             flush_interval,
+            wal_flush_interval,
             backoff: BackoffConfig::default(),
         }
     }
@@ -191,6 +202,12 @@ impl<S: BatchSink> Uploader<S> {
         let mut ticker = tokio::time::interval(self.config.flush_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Unabhängig vom Upload-Timer: begrenzt, wie viel ungesicherter Append
+        // im Absturzfall verloren gehen kann, ohne jeden Append einzeln zu
+        // fsyncen (siehe Doku an `UploaderConfig::wal_flush_interval`).
+        let mut wal_ticker = tokio::time::interval(self.config.wal_flush_interval);
+        wal_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 biased;
@@ -230,6 +247,12 @@ impl<S: BatchSink> Uploader<S> {
                 _ = ticker.tick() => {
                     if let Some(outcome) = self.flush_once().await {
                         return outcome;
+                    }
+                }
+
+                _ = wal_ticker.tick() => {
+                    if let Err(e) = self.queue.flush() {
+                        tracing::warn!(error = %e, "uploader: periodic WAL flush failed");
                     }
                 }
             }
@@ -300,6 +323,28 @@ impl<S: BatchSink> Uploader<S> {
             Ordering::Relaxed,
         );
         match response {
+            // Ein 2xx ist kein Freifahrtschein: das Gateway kann einen Batch
+            // teilweise annehmen und das über `errors`/`received` statt über
+            // den Statuscode ausdrücken. Ohne diese Prüfung würde hier
+            // unbedingt committet — die nicht angenommenen Events wären dann
+            // verloren, weil das WAL sie als erledigt markiert. Sicherer
+            // Default bei Zweifel: nicht committen, ganzen Batch erneut
+            // versuchen (at-least-once bleibt gewahrt, Doppel sind der
+            // akzeptierte Preis).
+            Ok(response) if response.errors > 0 || response.received < count => {
+                self.stats.backend_available.store(true, Ordering::Relaxed);
+                self.stats.upload_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    sent = count,
+                    accepted = response.received,
+                    errors = response.errors,
+                    "uploader: backend only partially accepted the batch — not committing, retrying the whole batch"
+                );
+                let delay = self.backoff.next_delay();
+                tokio::time::sleep(delay).await;
+                None
+            }
+
             Ok(response) => {
                 self.stats.backend_available.store(true, Ordering::Relaxed);
                 if let Err(e) = self.queue.commit(&batch) {
@@ -394,6 +439,8 @@ mod tests {
         Reject,
         Revoke,
         Routing,
+        /// A 2xx response that does not fully accept the batch.
+        Partial,
     }
 
     impl MockSink {
@@ -437,6 +484,11 @@ mod tests {
                     status: 404,
                     message: "not found".into(),
                 }),
+                MockResponse::Partial => Ok(IngestResponse {
+                    received: count.saturating_sub(1),
+                    errors: 1,
+                    request_id: None,
+                }),
             }
         }
     }
@@ -463,12 +515,63 @@ mod tests {
             sensor_version: "0.1.0".into(),
             batch_max_events: 3,
             flush_interval: Duration::from_millis(20),
+            wal_flush_interval: Duration::from_millis(20),
             backoff: BackoffConfig {
                 initial: Duration::from_millis(5),
                 max: Duration::from_millis(20),
                 multiplier: 2.0,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn wal_is_flushed_independently_of_the_upload_timer() {
+        // A long upload flush interval (and a batch cap that never fills)
+        // must not delay durability: a short, independent WAL flush timer is
+        // what bounds the crash-loss window, per finding #2.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sink, _received) = MockSink::new(vec![]);
+        let mut cfg = config();
+        cfg.batch_max_events = 1000;
+        cfg.flush_interval = Duration::from_secs(30);
+        cfg.wal_flush_interval = Duration::from_millis(20);
+        let uploader = Uploader::new(
+            queue(dir.path()),
+            sink,
+            cfg,
+            Arc::new(UploaderStats::default()),
+        );
+
+        let (tx, rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(uploader.run(rx, shutdown_rx));
+
+        // `tokio::time::interval` fires its *first* tick immediately, so both
+        // tickers flush once on startup regardless of their configured
+        // period. Let that initial (harmless, queue-empty) tick pass before
+        // sending the event under test, so the assertion below can only be
+        // satisfied by the independent WAL-flush ticker's *next*, genuinely
+        // periodic tick — not by the upload ticker's one-off startup flush.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        tx.send(event(1)).await.expect("send");
+        // Give the independent WAL-flush ticker a few more ticks — well
+        // before the 30s upload timer's next (non-immediate) tick and
+        // without ever hitting the shutdown/backoff flush paths.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The record must be visible to an independent reader of the segment
+        // file — i.e. actually handed to the OS, not just sitting in the
+        // in-process BufWriter buffer.
+        let segment = dir.path().join("critical").join("0000000000000001.log");
+        let on_disk = std::fs::read(&segment).expect("segment readable");
+        assert!(
+            !on_disk.is_empty(),
+            "the WAL flush ticker should have flushed the pending append to disk"
+        );
+
+        shutdown_tx.send(true).expect("shutdown");
+        handle.await.expect("join");
     }
 
     #[tokio::test]
@@ -652,6 +755,47 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.events_dropped, 1, "only the poison batch is lost");
         assert_eq!(snapshot.events_uploaded, 1, "the next event went through");
+    }
+
+    #[tokio::test]
+    async fn a_partial_2xx_ack_is_not_committed_and_is_retried() {
+        // The gateway answered with a 2xx but `errors > 0` / `received <
+        // sent` — the batch was not fully accepted. Committing the full WAL
+        // range here would silently lose the unaccepted events. Finding #5:
+        // this must be treated like a retryable failure, not a success.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sink, received) = MockSink::new(vec![MockResponse::Partial]);
+        let stats = Arc::new(UploaderStats::default());
+        let uploader = Uploader::new(queue(dir.path()), sink, config(), stats.clone());
+
+        let (tx, rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(uploader.run(rx, shutdown_rx));
+
+        tx.send(event(1)).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown_tx.send(true).expect("shutdown");
+        handle.await.expect("join");
+
+        let batches = received.lock().expect("lock");
+        assert!(
+            batches.len() >= 2,
+            "the partially-accepted batch must be retried, not treated as done"
+        );
+        assert!(
+            batches.iter().all(|b| b.len() == 1),
+            "the same single event is retried, not multiplied or split"
+        );
+        assert_eq!(
+            stats.snapshot().events_uploaded,
+            1,
+            "only the eventually fully-accepted upload counts"
+        );
+        assert_eq!(
+            stats.snapshot().upload_discarded,
+            0,
+            "a partial ack must not discard events"
+        );
     }
 
     #[tokio::test]

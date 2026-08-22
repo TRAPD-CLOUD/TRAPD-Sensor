@@ -179,12 +179,23 @@ impl SegmentedLog {
         Ok(written)
     }
 
-    /// Schreibt gepufferte Daten in die Datei. Wird vor jedem Upload aufgerufen,
-    /// damit ein Absturz zwischen Append und Upload nichts verschluckt.
+    /// Schreibt gepufferte Daten in die Datei und fsynct sie. Wird vor jedem
+    /// Upload aufgerufen, damit ein Absturz zwischen Append und Upload nichts
+    /// verschluckt.
+    ///
+    /// `BufWriter::flush()` allein reicht nicht: das übergibt die Daten nur an
+    /// den Seiten-Cache des Kernels, nicht an die Platte. Ein Stromausfall
+    /// direkt danach würde sie trotzdem verlieren — deshalb zusätzlich
+    /// `sync_all()` auf der zugrunde liegenden Datei.
     pub fn flush(&mut self) -> Result<()> {
         let path = self.active_path();
+        self.writer.flush().map_err(|source| BufferError::Io {
+            path: path.clone(),
+            source,
+        })?;
         self.writer
-            .flush()
+            .get_ref()
+            .sync_all()
             .map_err(|source| BufferError::Io { path, source })
     }
 
@@ -620,22 +631,72 @@ fn read_cursor(dir: &Path) -> Result<LogPosition> {
 /// Schreibt den Cursor atomar. Ein halb geschriebener Cursor würde nach einem
 /// Absturz an einer beliebigen Stelle im Log aufsetzen — deshalb erst in eine
 /// temporäre Datei, dann umbenennen.
+///
+/// Die temporäre Datei wird vor dem Rename gefsynct (Inhalt muss vor der
+/// Sichtbarwerdung auf der Platte liegen), danach die umbenannte Datei
+/// zusätzlich noch einmal (schadet nicht, macht die Absicht explizit) und —
+/// nur Linux/Unix, best effort — das Verzeichnis, damit auch der Rename
+/// selbst einen Absturz übersteht. Ein Verzeichnis-fsync-Fehlschlag ist kein
+/// harter Fehler: manche Dateisysteme/Container-Overlays unterstützen ihn
+/// nicht, und der Cursor-Inhalt ist zu diesem Zeitpunkt bereits durabel.
 fn write_cursor(dir: &Path, pos: LogPosition) -> Result<()> {
     let path = cursor_path(dir);
     let tmp = path.with_extension("tmp");
     let mut bytes = [0u8; 16];
     bytes[0..8].copy_from_slice(&pos.segment.to_le_bytes());
     bytes[8..16].copy_from_slice(&pos.offset.to_le_bytes());
-    std::fs::write(&tmp, bytes).map_err(|source| BufferError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|source| BufferError::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+        file.write_all(&bytes).map_err(|source| BufferError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| BufferError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+    }
     std::fs::rename(&tmp, &path).map_err(|source| BufferError::Io {
         path: path.clone(),
         source,
     })?;
+
+    if let Ok(file) = File::open(&path) {
+        let _ = file.sync_all();
+    }
+    sync_dir_best_effort(dir);
     Ok(())
 }
+
+/// Best-effort `fsync` des Verzeichnisses, damit ein Rename/Create darin einen
+/// Absturz übersteht. Fehler werden nur geloggt: nicht jedes Dateisystem
+/// unterstützt das öffnen/fsyncen eines Verzeichnisses, und ein Fehlschlag
+/// hier darf den eigentlichen (bereits durabel geschriebenen) Cursor nicht
+/// ungültig machen.
+#[cfg(unix)]
+fn sync_dir_best_effort(dir: &Path) {
+    match File::open(dir) {
+        Ok(dir_file) => {
+            if let Err(source) = dir_file.sync_all() {
+                tracing::warn!(path = %dir.display(), error = %source, "fsync of wal directory failed");
+            }
+        }
+        Err(source) => {
+            tracing::warn!(path = %dir.display(), error = %source, "could not open wal directory for fsync");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir_best_effort(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {

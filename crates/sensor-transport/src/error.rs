@@ -46,6 +46,13 @@ pub enum TransportError {
 
     #[error("enrollment failed: {0}")]
     Enrollment(String),
+
+    /// Konfiguriertes Client-Zertifikat/Key für mTLS konnte nicht geladen
+    /// werden. Ein harter Fehler: sind die Pfade gesetzt, muss mTLS auch
+    /// greifen — ein still übersprungenes Client-Zertifikat wäre ein
+    /// unbemerkter Rückfall auf schwächere Authentifizierung.
+    #[error("mTLS client identity error: {0}")]
+    Tls(String),
 }
 
 impl TransportError {
@@ -85,6 +92,7 @@ impl TransportError {
             Self::BadRequest { .. } => "bad_request",
             Self::Encode(_) => "encode",
             Self::Enrollment(_) => "enrollment",
+            Self::Tls(_) => "tls",
         }
     }
 }

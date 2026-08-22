@@ -4,12 +4,14 @@
 //! Fehlerklassifikation, das Backoff und die Uploader-Task, die die persistente
 //! Queue leert.
 //!
-//! Authentifiziert wird in v0.1 mit einem Bearer-Secret aus dem Enrollment —
+//! Authentifiziert wird primär mit einem Bearer-Secret aus dem Enrollment —
 //! dasselbe Verfahren wie beim Endpoint-Agent, damit Backend und Betrieb nur
-//! ein Modell kennen müssen. mTLS ist als spätere Ausbaustufe vorgesehen; die
-//! Trennung von `api_url` und `ingest_url` sowie die zentrale
-//! [`client::BackendClient`]-Fassade sind schon so geschnitten, dass der Wechsel
-//! den Rest des Sensors nicht berührt.
+//! ein Modell kennen müssen. Optional kann zusätzlich ein mTLS-Client-
+//! Zertifikat konfiguriert werden ([`client::ClientIdentity`],
+//! `backend.mtls_client_cert_path`/`_key_path`) — additiv und ohne den
+//! Bearer-Pfad zu ersetzen, standardmäßig aus. Die Trennung von `api_url`
+//! und `ingest_url` sowie die zentrale [`client::BackendClient`]-Fassade
+//! sind so geschnitten, dass das den Rest des Sensors nicht berührt.
 
 pub mod backoff;
 pub mod client;
@@ -18,7 +20,7 @@ pub mod remote_config;
 pub mod uploader;
 
 pub use backoff::{Backoff, BackoffConfig};
-pub use client::{BackendClient, EnrollRequest, EnrollResponse};
+pub use client::{BackendClient, ClientIdentity, EnrollRequest, EnrollResponse};
 pub use error::{Result, TransportError};
 pub use remote_config::{ApplyOutcome, RemoteConfig};
 pub use uploader::{
