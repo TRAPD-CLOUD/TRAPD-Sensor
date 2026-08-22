@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{Result, SensorError};
 
@@ -23,7 +24,12 @@ pub const IDENTITY_FILE: &str = "identity.json";
 const REQUIRED_MODE: u32 = 0o600;
 
 /// Ein Geheimnis, das sich nicht versehentlich ausgeben lässt.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// `Zeroize`/`ZeroizeOnDrop` sorgen dafür, dass der Klartext beim Fallenlassen
+/// (Scope-Ende, `std::mem::drop`, Prozessende ohne Absturz) im Speicher
+/// überschrieben wird, statt bis zur nächsten Wiederverwendung der Seite
+/// liegen zu bleiben.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct Secret(String);
 
@@ -210,6 +216,14 @@ mod tests {
             api_url: Some("https://api.example.com".into()),
             ingest_url: None,
         }
+    }
+
+    #[test]
+    fn secret_zeroizes_its_contents() {
+        use zeroize::Zeroize;
+        let mut s = Secret::new("hunter2");
+        s.zeroize();
+        assert_eq!(s.expose(), "", "zeroize must scrub the secret in place");
     }
 
     #[test]

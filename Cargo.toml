@@ -14,7 +14,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.12"
 edition = "2021"
 # Several locked transitive dependencies use the stabilized Rust 2024 manifest
 # format, and the locked ICU crates require Rust 1.86. Cargo/Rust 1.86 is

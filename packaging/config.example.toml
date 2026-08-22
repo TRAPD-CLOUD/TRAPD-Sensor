@@ -80,6 +80,11 @@ request_timeout_secs = 30
 # private IP als Backend-Host eingegeben wird. Ein oeffentliches Ziel bleibt
 # in jedem Fall abgelehnt.
 allow_insecure_private_http = false
+# Optionales Client-Zertifikat fuer mTLS zum Backend (PEM), zusaetzlich zum
+# Bearer-Secret. Beide Pfade muessen gesetzt sein, sonst bleibt mTLS aus —
+# der Standardweg. Auskommentiert = deaktiviert:
+# mtls_client_cert_path = "/etc/trapd-sensor/mtls/client.crt"
+# mtls_client_key_path = "/etc/trapd-sensor/mtls/client.key"
 
 [capture]
 # Leer = alle brauchbaren Interfaces automatisch.
@@ -184,6 +189,9 @@ dir = "/var/lib/trapd-sensor/queue"
 max_disk_bytes = 268435456   # 256 MiB
 segment_bytes = 8388608      # 8 MiB
 channel_capacity = 10000
+# Wie oft die WAL-Segmente unabhaengig vom Upload-Zyklus gefsynct werden.
+# Begrenzt das Absturz-Verlustfenster, getrennt von backend.flush_interval_secs.
+wal_flush_interval_secs = 1
 
 [update]
 # Selbsttaetiges Einspielen von Updates. Vorgabe aus; im Dashboard umschaltbar.

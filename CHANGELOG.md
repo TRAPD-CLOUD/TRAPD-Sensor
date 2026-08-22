@@ -62,6 +62,32 @@ All notable changes to TRAPD Sensor are documented here. The format follows
 
 ### Fixed
 
+- The workspace version pinned in `Cargo.toml` never actually moved past
+  `0.1.0`, even though `git`/release tags progressed through `v0.1.11` —
+  every built binary self-reported `sensor_version: "0.1.0"` in its
+  telemetry envelope and User-Agent regardless of which release it actually
+  was, making version-based rollout/incident correlation on the backend
+  unreliable. Bumped to track the next release.
+- WAL segments and the position cursor were never `fsync`'d — only handed to
+  the kernel page cache via `BufWriter::flush()` — so a power loss or kernel
+  panic could silently lose data that had already been reported as
+  "flushed". `SegmentedLog::flush()`/`write_cursor()` now `sync_all()` the
+  underlying file (and, best-effort on Unix, the containing directory after
+  a cursor rename).
+- Even with the above fix, appended records could sit unflushed for up to
+  `flush_interval_secs` (default 10s) since flushing was only driven by the
+  upload cycle. The uploader now runs a second, independent
+  `buffer.wal_flush_interval_secs` (default 1s) ticker so durability no
+  longer depends on the upload cadence.
+- The uploader treated any 2xx response as full acceptance of a batch
+  without checking `IngestResponse.received`/`errors`; a backend that ever
+  returns 2xx on a partially-accepted batch would have silently lost the
+  unaccepted events once the batch was committed. It now checks those
+  fields and retries the whole batch instead of committing on a partial ack.
+- `Secret` (mTLS/bearer-secret holder) is now `Zeroize`/`ZeroizeOnDrop`, so
+  the plaintext credential is scrubbed from memory on drop instead of
+  lingering in freed heap.
+
 - FRITZ!Box live capture and `setup --profile fritzbox` no longer reject
   captures from FRITZ!OS versions/interfaces that emit the extended
   (Alexey Kuznetsov-modified) classic-pcap format, magic `0xa1b2cd34`
@@ -74,6 +100,9 @@ All notable changes to TRAPD Sensor are documented here. The format follows
 
 ### Added
 
+- Optional mTLS client-certificate authentication to the backend
+  (`backend.mtls_client_cert_path`/`mtls_client_key_path`), additive to and
+  independent of the existing bearer-secret auth, off by default.
 - Vendor-isolated FRITZ!OS authentication and live-capture primitives: legacy
   and PBKDF2 challenge responses, router-advertised interface discovery,
   redirect-safe streaming capture, a bounded incremental classic-PCAP decoder,

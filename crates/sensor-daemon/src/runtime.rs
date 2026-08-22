@@ -33,7 +33,7 @@ use trapd_sensor_core::model::{
 use trapd_sensor_fingerprint::{FingerprintEngine, OuiDatabase};
 use trapd_sensor_passive::PassiveObserver;
 use trapd_sensor_transport::{
-    BackendClient, BackendSink, Uploader, UploaderConfig, UploaderOutcome,
+    BackendClient, BackendSink, ClientIdentity, Uploader, UploaderConfig, UploaderOutcome,
 };
 
 use crate::registry::DeviceRegistry;
@@ -101,7 +101,17 @@ impl Daemon {
             self.config.buffer.segment_bytes,
         )?;
 
-        let client = Arc::new(BackendClient::new(
+        let client_identity = match (
+            &self.config.backend.mtls_client_cert_path,
+            &self.config.backend.mtls_client_key_path,
+        ) {
+            (Some(cert_path), Some(key_path)) => Some(ClientIdentity {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+            }),
+            _ => None,
+        };
+        let client = Arc::new(BackendClient::with_client_identity(
             self.identity
                 .api_url
                 .as_deref()
@@ -111,6 +121,7 @@ impl Daemon {
                 .as_deref()
                 .unwrap_or(&self.config.backend.ingest_url),
             Duration::from_secs(self.config.backend.request_timeout_secs),
+            client_identity.as_ref(),
         )?);
 
         let sink = BackendSink::new(client.clone(), &self.identity);
@@ -121,6 +132,7 @@ impl Daemon {
                 &self.identity,
                 self.config.backend.batch_max_events,
                 Duration::from_secs(self.config.backend.flush_interval_secs),
+                Duration::from_secs(self.config.buffer.wal_flush_interval_secs),
             ),
             self.state.uploader.clone(),
         );

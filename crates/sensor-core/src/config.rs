@@ -149,6 +149,16 @@ pub struct BackendConfig {
     /// Loopback ist davon unabhängig immer erlaubt. Default `false`: ein
     /// öffentliches Klartext-Ziel bleibt in jedem Fall abgelehnt.
     pub allow_insecure_private_http: bool,
+    /// Optionales Client-Zertifikat für mTLS zum Backend (PEM). Nur zusammen
+    /// mit `mtls_client_key_path` wirksam. Default `None`: der Sensor
+    /// authentifiziert sich weiterhin ausschließlich über das
+    /// Bearer-Secret — mTLS ist eine rein additive Ausbaustufe, kein
+    /// Ersatz.
+    #[serde(default)]
+    pub mtls_client_cert_path: Option<PathBuf>,
+    /// Privater Schlüssel (PEM) zum Client-Zertifikat oben.
+    #[serde(default)]
+    pub mtls_client_key_path: Option<PathBuf>,
 }
 
 impl Default for BackendConfig {
@@ -163,6 +173,8 @@ impl Default for BackendConfig {
             request_timeout_secs: 30,
             tls_ca_pins_sha256: Vec::new(),
             allow_insecure_private_http: false,
+            mtls_client_cert_path: None,
+            mtls_client_key_path: None,
         }
     }
 }
@@ -368,6 +380,11 @@ pub struct BufferConfig {
     pub segment_bytes: u64,
     /// Obergrenze der In-Memory-Übergabe zwischen Collectors und Uploader.
     pub channel_capacity: usize,
+    /// Wie oft die WAL-Segmente unabhängig vom Upload-Zyklus gefsynct
+    /// werden. Begrenzt das Absturz-Verlustfenster, ohne bei jedem `append()`
+    /// einen fsync auszulösen — bewusst kurz gehalten und getrennt von
+    /// `backend.flush_interval_secs` (der auf Batching-Effizienz zielt).
+    pub wal_flush_interval_secs: u64,
 }
 
 impl Default for BufferConfig {
@@ -377,6 +394,7 @@ impl Default for BufferConfig {
             max_disk_bytes: 256 * 1024 * 1024,
             segment_bytes: 8 * 1024 * 1024,
             channel_capacity: 10_000,
+            wal_flush_interval_secs: 1,
         }
     }
 }
